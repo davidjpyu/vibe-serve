@@ -1,6 +1,6 @@
 # Objective — Llama-3-8B inference server
 
-Maximize **output token throughput (tok/s)** on a single H100 while keeping accuracy within the accuracy checker's tolerance. Build an OpenAI-compatible `/v1/chat/completions` and `/v1/completions` server.
+Maximize **output token throughput (tok/s)** on a single H200 while keeping accuracy within the accuracy checker's tolerance. Build an OpenAI-compatible `/v1/chat/completions` and `/v1/completions` server.
 
 ## Notes
 
