@@ -66,3 +66,18 @@ Code quality observations (informational, not gating): SSE emulated rather than 
 ### Feedback
 
 
+## Round 2 — Orchestrator (pre-round)
+- **need_profile**: False
+- **profile_focus**: 
+- **reasoning**: Round 1 passed accuracy 14/14 but reported only ~0.9 tok/s — the judge noted streaming is emulated (entire generation awaited, then one SSE frame). The floor items (continuous batching M2, FA/FlashInfer M3, CUDA graphs M5) are all unimplemented and apply directly to this multi-request Poisson workload; the next obvious step (continuous batching + per-token streaming) is clear from code inspection alone, so a profile would only re-tell us what we already know.
+
+## Round 2 — Profiler
+### Bottlenecks
+n/a
+
+### Suggestions
+Re-run profiling on the next round.
+
+### Analysis
+Profiler produced no structured response.
+
