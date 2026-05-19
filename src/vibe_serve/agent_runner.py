@@ -6,6 +6,10 @@ import uuid
 
 from pydantic import ValidationError
 
+# Must be defined before importing vibe_serve.agents.callbacks: agents/__init__.py
+# transitively loads cli_runner.py, which imports _DEFAULT_MAX_TEXT_LEN from here.
+_DEFAULT_MAX_TEXT_LEN = 2000
+
 from vibe_serve.agents.callbacks import AgentLogger, TodoDisplay
 from vibe_serve.schemas import (
     ImplementerResponse,
@@ -19,13 +23,6 @@ from vibe_serve.schemas import (
     ProfilerResponse,
     Verdict,
 )
-
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-_DEFAULT_MAX_TEXT_LEN = 2000
 _JUDGE_REVIEW_PROMPT = (
     "Review the implementation. "
     "Write or update pytest tests, run them via `uv run pytest -v`, "
