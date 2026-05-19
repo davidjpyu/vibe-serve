@@ -715,6 +715,34 @@ class VibeServeModel(nn.Module):
         logits = self.lm_head(hidden[:, -1, :])  # (B, V)
         return logits.argmax(dim=-1)
 
+    def decode_step_graph_safe(self, B_bucket: int, kv_len_bucket: int,
+                                input_ids_buf: torch.Tensor,
+                                lengths_after_buf: torch.Tensor,
+                                next_token_buf: torch.Tensor,
+                                pool: "Pool") -> None:
+        """One full decode step that reads from / writes to fixed-address static
+        buffers — the body that gets wrapped in a ``torch.cuda.CUDAGraph``.
+
+        ``B_bucket`` and ``kv_len_bucket`` are Python ints baked into the captured
+        kernel launches; tensor shapes are constant for a given bucket so the same
+        captured graph can be replayed for any actual ``B <= B_bucket`` and any
+        actual ``max_kv_len <= kv_len_bucket`` (the per-row attn mask handles the
+        slack).
+        """
+        last_tokens = input_ids_buf[:B_bucket].unsqueeze(1)              # (B_bucket, 1)
+        hidden = self.embed_tokens(last_tokens).to(self.dtype)
+        lengths_after = lengths_after_buf[:B_bucket]
+        for i, layer in enumerate(self.layers):
+            hidden = layer.decode_pool(
+                hidden,
+                pool.full_K[i], pool.full_V[i],
+                pool.gdn_state[i], pool.gdn_conv[i],
+                lengths_after, kv_len_bucket, B_bucket,
+            )
+        hidden = self.norm(hidden)
+        logits = self.lm_head(hidden[:, -1, :])                          # (B_bucket, V)
+        next_token_buf[:B_bucket].copy_(logits.argmax(dim=-1))
+
     # ---- R1 batch=1 .generate() retained for the accuracy checker ----
 
     def _build_caches_b1(self, max_len: int):
@@ -932,6 +960,21 @@ class StepEngine:
         self._step_count = 0
         self._max_observed_B = 0
 
+        # ----- CUDA graph state (set up by capture_graphs(); checked at decode time) -----
+        self.disable_cuda_graphs = bool(int(os.environ.get("VIBE_DISABLE_CUDA_GRAPHS", "0")))
+        self.graph_capture_done = False
+        self.capture_stream: torch.cuda.Stream | None = None
+        self.graph_pool = None  # torch.cuda.graph_pool_handle()
+        self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._bucket_b = [1, 2, 4, 8, 16]
+        self._bucket_kv = [128, 256, 512, 1024, 2048, 4096]
+        self._graph_replay_counts: dict[tuple[int, int], int] = {}
+        self._eager_fallback_count = 0
+        # Persistent step-I/O staging buffers — addresses captured into each graph.
+        self.input_ids_buf = torch.zeros(max_batch, dtype=torch.long, device=self.device)
+        self.lengths_after_buf = torch.zeros(max_batch, dtype=torch.long, device=self.device)
+        self.next_token_buf = torch.zeros(max_batch, dtype=torch.long, device=self.device)
+
     # ---- public API ----
 
     def submit(self, req: EngineRequest) -> None:
@@ -974,6 +1017,10 @@ class StepEngine:
             self.model.decode_batch(last_tokens, self.pool, max_batch, lengths_after, max_kv_len)
 
         # 3. Reset pool state so real requests start with zero length.
+        self._reset_pool_state()
+        torch.cuda.synchronize()
+
+    def _reset_pool_state(self) -> None:
         self.pool.lengths.zero_()
         for K in self.pool.full_K:
             if K is not None:
@@ -987,7 +1034,108 @@ class StepEngine:
         for c in self.pool.gdn_conv:
             if c is not None:
                 c.zero_()
+
+    # ---- CUDA graph capture / replay ------------------------------------------------
+
+    def capture_graphs(self) -> None:
+        """Capture one ``torch.cuda.CUDAGraph`` per (B_bucket, kv_len_bucket) combination,
+        all sharing a single ``graph_pool_handle`` to keep memory flat. Each captured
+        forward reads from / writes to the persistent step-I/O buffers, so the engine's
+        decode hot path just becomes ``update_buffers(); graph.replay()``.
+
+        Must be called AFTER ``warmup()`` (so Triton kernel JIT compiles have already
+        produced cached configs) and BEFORE ``start()`` (so the engine never runs the
+        un-graphed path under traffic).
+        """
+        if self.disable_cuda_graphs:
+            print("[graph] CUDA graphs DISABLED via VIBE_DISABLE_CUDA_GRAPHS=1; "
+                  "engine will use the R3 eager decode path.", flush=True)
+            return
+
+        device = self.device
+        self.graph_pool = torch.cuda.graph_pool_handle()
+        # Side stream is required by the torch.cuda.graph API; it must NOT be the
+        # default stream. Replays will record on whatever stream is current at
+        # replay time (typically the default stream), which is fine.
+        self.capture_stream = torch.cuda.Stream(device=device)
+
+        # Each capture overwrites the pool's first B_bucket slots; reset after.
+        for B_bucket in self._bucket_b:
+            if B_bucket > self.max_batch:
+                continue
+            for kv_len_bucket in self._bucket_kv:
+                if kv_len_bucket > self.max_len:
+                    continue
+                t0 = time.perf_counter()
+                try:
+                    self._capture_one_bucket(B_bucket, kv_len_bucket)
+                except Exception as exc:
+                    print(f"[graph] capture FAILED for B={B_bucket} kv_len={kv_len_bucket}: "
+                          f"{type(exc).__name__}: {exc}", flush=True)
+                    continue
+                dt_ms = (time.perf_counter() - t0) * 1000
+                print(f"[graph] captured B={B_bucket} kv_len={kv_len_bucket} in {dt_ms:.0f}ms",
+                      flush=True)
+                self._graph_replay_counts[(B_bucket, kv_len_bucket)] = 0
+
+        self.graph_capture_done = len(self.graphs) > 0
+        # Wipe everything captured graphs may have written and start the engine clean.
+        self._reset_pool_state()
+        self.input_ids_buf.zero_()
+        self.lengths_after_buf.zero_()
+        self.next_token_buf.zero_()
         torch.cuda.synchronize()
+        if self.graph_capture_done:
+            print(f"[graph] {len(self.graphs)} graphs captured; "
+                  f"buckets B={self._bucket_b} kv_len={self._bucket_kv}", flush=True)
+        else:
+            print("[graph] NO graphs captured; engine will use the R3 eager decode path.",
+                  flush=True)
+
+    def _capture_one_bucket(self, B_bucket: int, kv_len_bucket: int) -> None:
+        # Seed dummy state. lengths_after = kv_len_bucket means the new K is appended
+        # at position kv_len_bucket-1 — the worst case for this bucket.
+        self.pool.lengths[:B_bucket].fill_(kv_len_bucket - 1)
+        self.lengths_after_buf[:B_bucket].fill_(kv_len_bucket)
+        if B_bucket < self.max_batch:
+            # Padding rows write at position 0 and attend over only 1 K position;
+            # output is discarded, but values must be in-range for the kernels.
+            self.lengths_after_buf[B_bucket:].fill_(1)
+        self.input_ids_buf.zero_()
+
+        side_stream = self.capture_stream
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            # Triton autotune / cuBLAS algorithm-pick must finish BEFORE capture.
+            with torch.inference_mode():
+                for _ in range(3):
+                    self.model.decode_step_graph_safe(
+                        B_bucket, kv_len_bucket,
+                        self.input_ids_buf, self.lengths_after_buf,
+                        self.next_token_buf, self.pool,
+                    )
+            side_stream.synchronize()
+
+            g = torch.cuda.CUDAGraph()
+            with torch.inference_mode():
+                with torch.cuda.graph(g, pool=self.graph_pool):
+                    self.model.decode_step_graph_safe(
+                        B_bucket, kv_len_bucket,
+                        self.input_ids_buf, self.lengths_after_buf,
+                        self.next_token_buf, self.pool,
+                    )
+        torch.cuda.current_stream().wait_stream(side_stream)
+        self.graphs[(B_bucket, kv_len_bucket)] = g
+
+    def _pick_bucket(self, B: int, max_kv_len_actual: int) -> tuple[int, int] | None:
+        """Smallest (B_bucket, kv_len_bucket) that fits, or ``None`` for eager fallback."""
+        B_bucket = next((b for b in self._bucket_b if b >= B), None)
+        kv_len_bucket = next((b for b in self._bucket_kv if b >= max_kv_len_actual), None)
+        if B_bucket is None or kv_len_bucket is None:
+            return None
+        if (B_bucket, kv_len_bucket) not in self.graphs:
+            return None
+        return (B_bucket, kv_len_bucket)
 
     def start(self) -> None:
         self.task = asyncio.create_task(self._run())
@@ -1029,10 +1177,13 @@ class StepEngine:
 
             if self._step_log_interval > 0:
                 self._step_count += 1
-                self._max_observed_B = max(self._max_observed_B, self.B + len(self.active) - self.B)
+                self._max_observed_B = max(self._max_observed_B, self.B)
                 if self._step_count % self._step_log_interval == 0:
+                    replays = {f"B{b}/kv{k}": v
+                               for (b, k), v in self._graph_replay_counts.items() if v > 0}
                     print(f"[engine] step={self._step_count} B={self.B} "
-                          f"waiting={len(self.waiting)} max_observed_B={self._max_observed_B}",
+                          f"waiting={len(self.waiting)} max_observed_B={self._max_observed_B} "
+                          f"replays={replays} eager_steps={self._eager_fallback_count}",
                           flush=True)
 
             # Yield to other tasks so SSE handlers can flush queued tokens.
@@ -1074,17 +1225,54 @@ class StepEngine:
             req.out_queue.put_nowait((first_tok, None))
 
     def _decode_step(self) -> None:
+        """Advance every active request by one token. Dispatches to a captured
+        CUDAGraph for the (B, max_kv_len) bucket if one exists; falls back to the R3
+        eager path (``model.decode_batch``) otherwise. Token bookkeeping (EOS check,
+        max_tokens check, slot reclamation via ``_swap_pop_slot``) happens in eager
+        Python *outside* the captured region — CUDAGraphs can't include conditional
+        control flow."""
         B = self.B
-        last_tokens = torch.tensor(
-            [r.last_token for r in self.active], dtype=torch.long, device=self.device,
-        ).unsqueeze(1)  # (B, 1)
-        # After append, each row's K/V length = lengths[slot] + 1.
+        # Bump KV lengths in place; the new K/V is appended at position lengths-1
+        # by the forward (eager or graph).
         self.pool.lengths[:B] += 1
-        lengths_after = self.pool.lengths[:B]
-        max_kv_len = int(lengths_after.max().item())
+        max_kv_len_actual = int(self.pool.lengths[:B].max().item())
 
-        new_tokens = self.model.decode_batch(last_tokens, self.pool, B, lengths_after, max_kv_len)
-        new_tokens_cpu = new_tokens.tolist()
+        bucket = (
+            None if (self.disable_cuda_graphs or not self.graph_capture_done)
+            else self._pick_bucket(B, max_kv_len_actual)
+        )
+
+        if bucket is None:
+            # Eager R3 path (also used until graphs are captured).
+            self._eager_fallback_count += 1
+            last_tokens = torch.tensor(
+                [r.last_token for r in self.active], dtype=torch.long, device=self.device,
+            ).unsqueeze(1)
+            new_tokens = self.model.decode_batch(
+                last_tokens, self.pool, B, self.pool.lengths[:B], max_kv_len_actual,
+            )
+            new_tokens_cpu = new_tokens.tolist()
+        else:
+            B_bucket, kv_len_bucket = bucket
+            # Stage inputs into the captured graph's static buffers.
+            last_tokens_cpu = [r.last_token for r in self.active]
+            # Pad with zeros so the [B:B_bucket] slots are deterministic.
+            if B_bucket > B:
+                last_tokens_cpu = last_tokens_cpu + [0] * (B_bucket - B)
+            self.input_ids_buf[:B_bucket].copy_(
+                torch.tensor(last_tokens_cpu, dtype=torch.long, device=self.device),
+            )
+            self.lengths_after_buf[:B].copy_(self.pool.lengths[:B])
+            if B_bucket > B:
+                # Padding rows attend over 1 K position (in-range); their outputs are
+                # written to next_token_buf[B:B_bucket] but never read out.
+                self.lengths_after_buf[B:B_bucket].fill_(1)
+            # Replay the captured graph. CUDAGraph.replay() records on whichever
+            # stream is current here (the default stream — fine since capture's
+            # side stream was joined back via wait_stream).
+            self.graphs[bucket].replay()
+            self._graph_replay_counts[bucket] += 1
+            new_tokens_cpu = self.next_token_buf[:B].tolist()
 
         finished: list[int] = []
         for i, req in enumerate(self.active):
@@ -1180,6 +1368,9 @@ async def _lifespan(app: FastAPI):
     t0 = time.perf_counter()
     engine.warmup()
     print(f"[vibeserve] warmup completed in {time.perf_counter() - t0:.1f}s", flush=True)
+    t0 = time.perf_counter()
+    engine.capture_graphs()
+    print(f"[vibeserve] graph capture completed in {time.perf_counter() - t0:.1f}s", flush=True)
     engine.start()
     print(f"[vibeserve] engine started (MAX_BATCH={max_batch}, MAX_LEN={max_len})", flush=True)
 

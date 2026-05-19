@@ -56,18 +56,17 @@ Only after these three are in place do we move to workload-specific optimization
   Bench at `--rate 8 --num-requests 32 --max-tokens 64`: 264.9 tok/s aggregate
   (≈294× R1), 14/14 accuracy preserved.
 
-- **M3: Attention kernel — FlashAttention on full-attention layers** — `in_progress`, R3.
-  Replace eager `matmul → mask → softmax(fp32) → matmul` in `Qwen35FullAttention` with
-  `flash_attn.flash_attn_with_kvcache` (decode) and `flash_attn.flash_attn_varlen_func`
-  (prefill). Drops the `repeat_interleave` GQA expansion (FA accepts `num_kv_heads` directly),
-  fuses the attention chain into one kernel, and keeps causality + per-row K-length masking
-  via `cache_seqlens`. Partial RoPE (first 64 dims of head) is still applied before FA, so
-  RoPE is unaffected; the sigmoid `attn_output_gate` still runs on FA's output before
-  `o_proj`. Pool layout flip from `(B, num_kv_heads, MAX_LEN, head_dim)` to
-  `(B, MAX_LEN, num_kv_heads, head_dim)` is required to match FA's expected memory order.
-  Why: profiler shows GEMMs (the 4 linears per full-attn layer + the 2 matmuls inside
-  attention) + `direct_copy_kernel` from `repeat_interleave` are major contributors; FA
-  removes the inner matmuls and the GQA materialization in one swap.
+- **M3: Attention kernel — FlashAttention on full-attention layers** — `done` (R3, via SDPA fallback).
+  FA2/FA3 PyPI wheels do not target torch 2.12+cu13 and the sandbox is driver-only (no CUDA
+  toolkit for from-source build), so the implementation landed on
+  `F.scaled_dot_product_attention(..., enable_gqa=True)` — explicitly documented as the
+  fallback in R3's task. The architectural wins from M3 are present: pool is NHD layout,
+  GQA grouping is handled inside the kernel (no `repeat_interleave`), the explicit
+  `matmul → mask → fp32 softmax → matmul` chain is gone. Decode uses
+  `sdpa_kernel([SDPBackend.MATH])` to dodge cuDNN per-shape replanning on the growing K-cache.
+  Headline tok/s: 244 tok/s mean (3 seeds) at `--rate 8 --num-requests 32 --max-tokens 64`
+  vs R2's 264.9 single-sample (≈0.92×, within Poisson noise); 297 tok/s at `--rate 16` >
+  R2's 265. Accuracy still 14/14.
 
 - **M4: GDN Triton kernel (`fla` integration tightened)** — `todo`, R3-R4.
   Confirm `fla.ops.gated_delta_rule` (chunked or fused-recurrent path) is on the hot decode
@@ -75,12 +74,19 @@ Only after these three are in place do we move to workload-specific optimization
   the Triton conv-1d shows up in the profile.
   Why: 24 of 32 layers are linear-attn — kernel quality there dominates.
 
-- **M5: CUDA graphs on decode** — `todo`, R4-R5.
-  Capture per-batch-size buckets {1, 2, 4, 8, 16, 32} of the decode step. Replay covers both
-  linear-attn (`fla` fused-recurrent) and full-attn (FlashInfer decode). Requires KV/GDN-state
-  buffers to be persistent and indexed (no allocations per step).
-  Why: at single-step decode on H200, host-side launch overhead is the dominant cost once
-  kernels are tight.
+- **M5: CUDA graphs on decode** — `in_progress`, R4.
+  Capture per-(B, kv_len_bucket) decode-step graphs. Buckets: B ∈ {1, 2, 4, 8, 16}
+  (MAX_BATCH=16 from R2), kv_len ∈ {128, 256, 512, 1024, 2048, 4096}. Pools are already
+  persistent and written in-place (R2/R3), so the only new persistent tensors needed are the
+  per-step input/output staging buffers (`hidden_in[B,1,hidden]`, `lengths_after[B]`,
+  `next_token[B]`). SDPA decode is pinned to `SDPBackend.MATH` (R3) or `EFFICIENT_ATTENTION`
+  — both graph-capturable. fla's `fused_recurrent_gated_delta_rule` is Triton with fixed
+  shapes per bucket, also graph-capturable. Per-row K-masking inside the graph: precompute
+  a persistent `arange[max_kv_len]`, build `mask = arange < lengths_after.unsqueeze(...)`
+  at replay time.
+  Why: profile shows 1377 ms CPU vs 119 ms GPU for 16 decode steps (~2048 launches/token,
+  ~78% GPU-idle per step). Eliminating launch overhead is the single largest remaining lever;
+  predicted move from ~250 to ~600-900 tok/s aggregate.
 
 ## Minor
 
@@ -90,6 +96,7 @@ Only after these three are in place do we move to workload-specific optimization
 
 - **M1** — Accurate baseline server. R1. 14/14 accuracy.
 - **M2** — Continuous batching + per-token SSE. R2. 264.9 tok/s (≈294× R1), 14/14 accuracy.
+- **M3** — SDPA `enable_gqa=True` on full-attn (FA fallback path). R3. 244-297 tok/s, 14/14.
 
 ## Parked
 
