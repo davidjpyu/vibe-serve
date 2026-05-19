@@ -12,8 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from .base import AgentRunner
-from .cli_runner import CliAgentRunner
-from .deepagents_runner import DeepAgentsRunner
+
+# cli_runner + deepagents_runner are imported lazily inside build_agent_runner
+# to avoid a circular import: cli_runner imports from vibe_serve.agent_runner,
+# which itself imports vibe_serve.agents.callbacks (loading this package).
+if False:  # for type checkers only
+    from .cli_runner import CliAgentRunner
+    from .deepagents_runner import DeepAgentsRunner
 
 __all__ = ["AgentRunner", "DeepAgentsRunner", "CliAgentRunner", "build_agent_runner"]
 
@@ -72,6 +77,8 @@ def build_agent_runner(
     )
 
     if backend == "deepagents":
+        from .deepagents_runner import DeepAgentsRunner
+
         if backends is None:
             raise SystemExit(
                 "internal error: build_agent_runner called with backend='deepagents' "
@@ -86,6 +93,8 @@ def build_agent_runner(
         )
 
     if backend == "cli":
+        from .cli_runner import CliAgentRunner
+
         provider = cli_provider or (config.get("agent") or {}).get("cli_provider") or "codex"
         docker_sandboxes = None
         modal_sandboxes = None
