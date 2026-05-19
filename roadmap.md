@@ -48,22 +48,26 @@ Only after these three are in place do we move to workload-specific optimization
   → broken TTFT/per-token streaming), and the server is **single-batch** behind an
   asyncio.Lock (~0.9 tok/s observed) — both addressed by M2.
 
-- **M2: Continuous batching + per-token SSE streaming** — `in_progress`, R2.
-  Decode many requests in lockstep on the GPU, one token per step, instead of one-request-at-a-time
-  under a lock. Per-request KV slots for the 8 full-attn layers and per-request (recurrent_state,
-  conv_state) slots for the 24 GDN layers. Single async step-engine task pulls newly arrived
-  requests, prefills them (one at a time or in a batched prefill), assigns them to free slots,
-  then runs a batched decode step that advances every active sequence by one token. Per-step
-  outputs feed per-request asyncio.Queues so SSE writers emit one token immediately as it is
-  produced. Headline metric: aggregate output tok/s on the Poisson workload.
-  Why: this is the floor item that matters most here — the benchmark is multi-request Poisson,
-  and round 1 caps at 1/(per-request generate time) because of the lock + emulated streaming.
+- **M2: Continuous batching + per-token SSE streaming** — `done` (R2).
+  `StepEngine` async task owns the GPU; alternates per-request prefill admit + batched decode
+  over contiguous active prefix [0:B). Per-layer pooled caches: 8 × full-attn K/V pool
+  `(MAX_BATCH=16, num_kv_heads=4, MAX_LEN=4096, head_dim=256)` fp16; 24 × GDN recurrent_state
+  `(16,32,128,128)` fp32 + conv_state `(16, conv_dim=8192, 3)` fp16. SSE: one token per frame.
+  Bench at `--rate 8 --num-requests 32 --max-tokens 64`: 264.9 tok/s aggregate
+  (≈294× R1), 14/14 accuracy preserved.
 
-- **M3: Attention kernel — FlashAttention/FlashInfer on full-attention layers** — `todo`, R3.
-  Replace eager attention with FA2 / FlashInfer batched-decode (8 full-attn layers, GQA 16:4,
-  head_dim=256, partial RoPE applied to first 64 dims). Folds RoPE+attention into one kernel
-  group; skips materializing the full (B, H, T, T) attention matrix.
-  Why: full-attention layers dominate per-token math once linear-attn kernels are tight.
+- **M3: Attention kernel — FlashAttention on full-attention layers** — `in_progress`, R3.
+  Replace eager `matmul → mask → softmax(fp32) → matmul` in `Qwen35FullAttention` with
+  `flash_attn.flash_attn_with_kvcache` (decode) and `flash_attn.flash_attn_varlen_func`
+  (prefill). Drops the `repeat_interleave` GQA expansion (FA accepts `num_kv_heads` directly),
+  fuses the attention chain into one kernel, and keeps causality + per-row K-length masking
+  via `cache_seqlens`. Partial RoPE (first 64 dims of head) is still applied before FA, so
+  RoPE is unaffected; the sigmoid `attn_output_gate` still runs on FA's output before
+  `o_proj`. Pool layout flip from `(B, num_kv_heads, MAX_LEN, head_dim)` to
+  `(B, MAX_LEN, num_kv_heads, head_dim)` is required to match FA's expected memory order.
+  Why: profiler shows GEMMs (the 4 linears per full-attn layer + the 2 matmuls inside
+  attention) + `direct_copy_kernel` from `repeat_interleave` are major contributors; FA
+  removes the inner matmuls and the GQA materialization in one swap.
 
 - **M4: GDN Triton kernel (`fla` integration tightened)** — `todo`, R3-R4.
   Confirm `fla.ops.gated_delta_rule` (chunked or fused-recurrent path) is on the hot decode
@@ -84,7 +88,8 @@ Only after these three are in place do we move to workload-specific optimization
 
 ## Done
 
-- **M1** — Accurate baseline server. R1 commit `round-1-retry-1-judge`. 14/14 accuracy.
+- **M1** — Accurate baseline server. R1. 14/14 accuracy.
+- **M2** — Continuous batching + per-token SSE. R2. 264.9 tok/s (≈294× R1), 14/14 accuracy.
 
 ## Parked
 

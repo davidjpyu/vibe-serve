@@ -33,7 +33,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoConfig, AutoTokenizer
+
+# SDPA backend preferences. Two separate orderings:
+#   - Decode path (growing K_cache length each step → unique shape per call): use MATH.
+#     cuDNN heuristic-searches a kernel per unique (B, H, T_q, T_k, D) tuple at ~125 ms
+#     *per shape*, which dominates wall clock when T_k advances every step.
+#   - Prefill / batch=1 paths (uniform self-attention): use FlashAttention/cuDNN first;
+#     each request hits the same shape only once anyway and the kernel is much faster
+#     than MATH for prefill's larger (B, H, T, T) workload.
+SDPA_DECODE_BACKENDS = [SDPBackend.MATH]
+SDPA_PREFILL_BACKENDS = [
+    SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH,
+]
 
 from fla.modules import FusedRMSNormGated
 from fla.ops.gated_delta_rule import (
@@ -89,9 +103,9 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_partial_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """q,k: (B, H, T, D). cos/sin: (B, T, rotary_dim). Only the first rotary_dim of D rotates."""
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
+    """q,k: (B, T, H, D). cos/sin: (B, T, rotary_dim). Only the first rotary_dim of D rotates."""
+    cos = cos.unsqueeze(2)
+    sin = sin.unsqueeze(2)
     rd = cos.shape[-1]
     q_rot, q_pass = q[..., :rd], q[..., rd:]
     k_rot, k_pass = k[..., :rd], k[..., rd:]
@@ -117,23 +131,73 @@ class Qwen35MLP(nn.Module):
 
 
 class FullAttnCache:
-    """Per-request KV cache used by the R1 ``.generate()`` path (batch=1)."""
+    """Per-request KV cache used by the R1 ``.generate()`` path (batch=1). NHD layout."""
 
     def __init__(self, max_len: int, num_kv_heads: int, head_dim: int, device, dtype):
-        self.k = torch.empty(1, num_kv_heads, max_len, head_dim, device=device, dtype=dtype)
-        self.v = torch.empty(1, num_kv_heads, max_len, head_dim, device=device, dtype=dtype)
+        self.k = torch.empty(1, max_len, num_kv_heads, head_dim, device=device, dtype=dtype)
+        self.v = torch.empty(1, max_len, num_kv_heads, head_dim, device=device, dtype=dtype)
         self.length = 0
 
     def append(self, new_k: torch.Tensor, new_v: torch.Tensor):
-        L = new_k.shape[2]
+        """new_k/new_v: (1, T, num_kv_heads, head_dim). Returns the populated prefix views."""
+        L = new_k.shape[1]
         end = self.length + L
-        self.k[:, :, self.length:end].copy_(new_k)
-        self.v[:, :, self.length:end].copy_(new_v)
+        self.k[:, self.length:end, :, :].copy_(new_k)
+        self.v[:, self.length:end, :, :].copy_(new_v)
         self.length = end
-        return self.k[:, :, :end], self.v[:, :, :end]
+        return self.k[:, :end, :, :], self.v[:, :end, :, :]
+
+
+# Attention backend selection: try FA3, then FA2 (`flash_attn_with_kvcache`),
+# then fall back to PyTorch SDPA with ``enable_gqa=True``. Set by ``select_attn_backend``.
+ATTN_BACKEND: str = "uninitialized"
+_FA_WITH_KVCACHE = None
+_FA_FUNC = None
+
+
+def select_attn_backend() -> str:
+    """Pick the best installed attention backend; returns the name of the active backend.
+
+    Order: ``flash_attn_3`` (Dao-AILab FA3 hopper) > ``flash_attn_2`` (`flash_attn` PyPI)
+    > ``sdpa-gqa`` (always present). Logged once at startup.
+    """
+    global ATTN_BACKEND, _FA_WITH_KVCACHE, _FA_FUNC
+    try:
+        import flash_attn_interface  # type: ignore[import-not-found]
+        _FA_WITH_KVCACHE = getattr(flash_attn_interface, "flash_attn_with_kvcache", None)
+        _FA_FUNC = getattr(flash_attn_interface, "flash_attn_func", None)
+        if _FA_WITH_KVCACHE is not None and _FA_FUNC is not None:
+            ATTN_BACKEND = "flash_attn_3"
+            return ATTN_BACKEND
+    except ImportError:
+        pass
+    try:
+        from flash_attn import flash_attn_func, flash_attn_with_kvcache  # type: ignore[import-not-found]
+        _FA_WITH_KVCACHE = flash_attn_with_kvcache
+        _FA_FUNC = flash_attn_func
+        ATTN_BACKEND = "flash_attn_2"
+        return ATTN_BACKEND
+    except ImportError:
+        pass
+    ATTN_BACKEND = "sdpa-gqa"
+    return ATTN_BACKEND
+
+
+# Initialize the attention backend at import time so the accuracy-checker path
+# (`VibeServeModel.from_pretrained(...).generate(...)`) sees a chosen backend even
+# when the FastAPI lifespan isn't running.
+select_attn_backend()
 
 
 class Qwen35FullAttention(nn.Module):
+    """GQA 16:4 / head_dim=256 / partial-RoPE / sigmoid-output-gated attention.
+
+    The attention kernel is selected by ``select_attn_backend`` at server startup.
+    All three call sites (R1 ``forward``, ``prefill_pool``, ``decode_pool``) route
+    through the same backend so GQA grouping is handled inside the kernel and no
+    explicit softmax / ``torch.repeat_interleave`` runs inside this class.
+    """
+
     def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int, head_dim: int,
                  rms_eps: float, rotary: Qwen35RotaryEmb):
         super().__init__()
@@ -151,10 +215,10 @@ class Qwen35FullAttention(nn.Module):
         self.q_norm = Qwen35RMSNorm(head_dim, eps=rms_eps)
         self.k_norm = Qwen35RMSNorm(head_dim, eps=rms_eps)
 
-    # ---- R1 single-batch path (used by .generate() / accuracy checker) ----
+    # ---- helpers ----
 
-    def forward(self, hidden: torch.Tensor, position_ids: torch.Tensor,
-                cache: FullAttnCache | None) -> torch.Tensor:
+    def _project_qkv(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project hidden -> (q, gate, k, v) in BTHD layout with q/k norms applied."""
         B, T, _ = hidden.shape
         qg = self.q_proj(hidden).view(B, T, self.num_heads, self.head_dim * 2)
         q, gate = torch.chunk(qg, 2, dim=-1)
@@ -162,23 +226,112 @@ class Qwen35FullAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(self.k_proj(hidden).view(B, T, self.num_kv_heads, self.head_dim))
         v = self.v_proj(hidden).view(B, T, self.num_kv_heads, self.head_dim)
-        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
+        return q, gate, k, v
+
+    def _attn_prefill(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Self-attention over uniform-length Q/K (B, T, H, D), causal.
+
+        Returns (B, T, num_q_heads, head_dim)."""
+        if ATTN_BACKEND in ("flash_attn_2", "flash_attn_3") and _FA_FUNC is not None:
+            return _FA_FUNC(q, k, v, causal=True, softmax_scale=self.scaling)
+        # SDPA expects (B, H, T, D); permute for the call, then back.
+        q_b = q.transpose(1, 2).contiguous()
+        k_b = k.transpose(1, 2).contiguous()
+        v_b = v.transpose(1, 2).contiguous()
+        with sdpa_kernel(SDPA_PREFILL_BACKENDS):
+            out = F.scaled_dot_product_attention(
+                q_b, k_b, v_b, is_causal=True, enable_gqa=True, scale=self.scaling,
+            )
+        return out.transpose(1, 2).contiguous()  # (B, T, H_q, D)
+
+    def _attn_decode(self, q_new: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor,
+                     K_pool: torch.Tensor, V_pool: torch.Tensor,
+                     lengths_after: torch.Tensor, max_kv_len: int, B: int) -> torch.Tensor:
+        """Append `k_new`/`v_new` into the pool slot and run attention over the active prefix.
+
+        K_pool / V_pool layout: ``(MAX_BATCH, MAX_LEN, num_kv_heads, head_dim)``.
+        ``lengths_after``: int[B] K/V length *after* this step's append.
+        Returns ``(B, 1, num_q_heads, head_dim)``.
+        """
+        # 1. Append new K/V in place into the pool at row i, position lengths_after[i]-1.
+        batch_idx = torch.arange(B, device=K_pool.device)
+        write_pos = lengths_after - 1
+        K_pool[batch_idx, write_pos, :, :] = k_new[:, 0, :, :]
+        V_pool[batch_idx, write_pos, :, :] = v_new[:, 0, :, :]
+
+        if ATTN_BACKEND in ("flash_attn_2", "flash_attn_3") and _FA_WITH_KVCACHE is not None:
+            # FA `with_kvcache` consumes (B, max_seqlen_k, H_kv, D) NHD caches and the new
+            # K/V via `cache_seqlens` = lengths BEFORE the append. We pass the already-
+            # appended caches with `k=None, v=None` and `cache_seqlens = lengths_after`.
+            cache_seqlens = lengths_after.to(torch.int32)
+            out = _FA_WITH_KVCACHE(
+                q=q_new,
+                k_cache=K_pool[:B],
+                v_cache=V_pool[:B],
+                k=None, v=None,
+                cache_seqlens=cache_seqlens,
+                causal=True,
+                softmax_scale=self.scaling,
+            )
+            return out  # (B, 1, num_q_heads, head_dim)
+
+        # SDPA fallback path.
+        full_k_bthd = K_pool[:B, :max_kv_len, :, :]   # (B, max_kv_len, H_kv, D)
+        full_v_bthd = V_pool[:B, :max_kv_len, :, :]
+        # SDPA wants BHTD; do a transpose-view (last dim stays contiguous).
+        q_b = q_new.transpose(1, 2).contiguous()                       # (B, H_q, 1, D)
+        k_b = full_k_bthd.transpose(1, 2)                              # (B, H_kv, max_kv_len, D)
+        v_b = full_v_bthd.transpose(1, 2)
+        pos_j = torch.arange(max_kv_len, device=q_new.device)
+        keep = pos_j[None, None, None, :] < lengths_after[:, None, None, None]
+        attn_mask = torch.where(
+            keep, q_new.new_zeros(()), q_new.new_full((), float("-inf")),
+        )                                                              # (B, 1, 1, max_kv_len)
+        with sdpa_kernel(SDPA_DECODE_BACKENDS):
+            out_b = F.scaled_dot_product_attention(
+                q_b, k_b, v_b, attn_mask=attn_mask, is_causal=False,
+                enable_gqa=True, scale=self.scaling,
+            )
+        return out_b.transpose(1, 2).contiguous()                      # (B, 1, H_q, D)
+
+    # ---- R1 single-batch path (used by .generate() / accuracy checker) ----
+
+    def forward(self, hidden: torch.Tensor, position_ids: torch.Tensor,
+                cache: FullAttnCache | None) -> torch.Tensor:
+        B, T, _ = hidden.shape
+        q, gate, k, v = self._project_qkv(hidden)                       # all BTHD
         cos, sin = self.rotary.cos_sin(position_ids, q.dtype)
         q, k = apply_partial_rope(q, k, cos, sin)
         if cache is not None:
-            full_k, full_v = cache.append(k, v)
+            full_k, full_v = cache.append(k, v)                         # NHD views
         else:
             full_k, full_v = k, v
-        full_k = full_k.repeat_interleave(self.num_kv_groups, dim=1)
-        full_v = full_v.repeat_interleave(self.num_kv_groups, dim=1)
-        S_q, S_k = q.shape[2], full_k.shape[2]
-        scores = torch.matmul(q, full_k.transpose(-2, -1)) * self.scaling
-        if S_q > 1:
-            i = torch.arange(S_q, device=scores.device).unsqueeze(-1)
-            j = torch.arange(S_k, device=scores.device).unsqueeze(0)
-            scores = scores.masked_fill(j > (S_k - S_q + i), float("-inf"))
-        attn = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        out = torch.matmul(attn, full_v).transpose(1, 2).contiguous().reshape(B, T, -1)
+
+        if T == full_k.shape[1]:
+            # Pure self-attention (prefill, no prior context).
+            out = self._attn_prefill(q, full_k, full_v)                 # (1, T, H_q, D)
+        else:
+            # T < cache_len: decode step (T == 1 in practice).
+            if ATTN_BACKEND in ("flash_attn_2", "flash_attn_3") and _FA_FUNC is not None:
+                # FA func handles uniform-length self-attn. For decode we need Q to
+                # attend over the full cached K; use FA's `flash_attn_func` with a
+                # K of shape (1, cache_len, H_kv, D) and Q of (1, T=1, H_q, D); FA
+                # bottom-right-aligns the causal mask, so the single Q attends to all K.
+                out = _FA_FUNC(q, full_k, full_v, causal=True, softmax_scale=self.scaling)
+            else:
+                # SDPA: bottom-right alignment for is_causal=True with Sq < Sk does
+                # not exist; with Sq=1 a causal mask is trivially satisfied so we
+                # just pass is_causal=False with no mask (Q attends to all K).
+                q_b = q.transpose(1, 2).contiguous()
+                k_b = full_k.transpose(1, 2)
+                v_b = full_v.transpose(1, 2)
+                with sdpa_kernel(SDPA_DECODE_BACKENDS):
+                    out_b = F.scaled_dot_product_attention(
+                        q_b, k_b, v_b, is_causal=False, enable_gqa=True, scale=self.scaling,
+                    )
+                out = out_b.transpose(1, 2).contiguous()
+
+        out = out.reshape(B, T, self.num_heads * self.head_dim)
         out = out * torch.sigmoid(gate)
         return self.o_proj(out)
 
@@ -187,70 +340,32 @@ class Qwen35FullAttention(nn.Module):
     def prefill_pool(self, hidden: torch.Tensor, position_ids: torch.Tensor,
                      K_pool: torch.Tensor, V_pool: torch.Tensor, slot: int) -> torch.Tensor:
         """Single-request prefill into slot ``slot`` of the per-layer K/V pool.
-        K_pool/V_pool: (MAX_BATCH, num_kv_heads, MAX_LEN, head_dim).
-        """
+        K_pool/V_pool layout: (MAX_BATCH, MAX_LEN, num_kv_heads, head_dim) (NHD)."""
         B, T, _ = hidden.shape  # B == 1
-        qg = self.q_proj(hidden).view(B, T, self.num_heads, self.head_dim * 2)
-        q, gate = torch.chunk(qg, 2, dim=-1)
-        gate = gate.reshape(B, T, self.num_heads * self.head_dim)
-        q = self.q_norm(q)
-        k = self.k_norm(self.k_proj(hidden).view(B, T, self.num_kv_heads, self.head_dim))
-        v = self.v_proj(hidden).view(B, T, self.num_kv_heads, self.head_dim)
-        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
+        q, gate, k, v = self._project_qkv(hidden)
         cos, sin = self.rotary.cos_sin(position_ids, q.dtype)
         q, k = apply_partial_rope(q, k, cos, sin)
 
-        # Write prompt K/V into the pool slot's prefix [0, T).
-        K_pool[slot, :, :T, :].copy_(k[0])
-        V_pool[slot, :, :T, :].copy_(v[0])
+        # Write prompt K/V into the pool slot's prefix [0, T). NHD layout.
+        K_pool[slot, :T, :, :].copy_(k[0])
+        V_pool[slot, :T, :, :].copy_(v[0])
 
-        full_k = k.repeat_interleave(self.num_kv_groups, dim=1)
-        full_v = v.repeat_interleave(self.num_kv_groups, dim=1)
-        scores = torch.matmul(q, full_k.transpose(-2, -1)) * self.scaling
-        i = torch.arange(T, device=scores.device).unsqueeze(-1)
-        j = torch.arange(T, device=scores.device).unsqueeze(0)
-        scores = scores.masked_fill(j > i, float("-inf"))
-        attn = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        out = torch.matmul(attn, full_v).transpose(1, 2).contiguous().reshape(B, T, -1)
+        out = self._attn_prefill(q, k, v)                               # (1, T, H_q, D)
+        out = out.reshape(B, T, self.num_heads * self.head_dim)
         out = out * torch.sigmoid(gate)
         return self.o_proj(out)
 
     def decode_pool(self, hidden: torch.Tensor, K_pool: torch.Tensor, V_pool: torch.Tensor,
                     lengths_after: torch.Tensor, max_kv_len: int, B: int) -> torch.Tensor:
-        """Batched single-token decode over the contiguous active prefix ``[0, B)``.
-        ``lengths_after``: LongTensor[B] of K/V length *after* writing this step's new K/V
-        (so the new token sits at index ``lengths_after - 1``).
-        """
-        qg = self.q_proj(hidden).view(B, 1, self.num_heads, self.head_dim * 2)
-        q, gate = torch.chunk(qg, 2, dim=-1)
-        gate = gate.reshape(B, 1, self.num_heads * self.head_dim)
-        q = self.q_norm(q)
-        k = self.k_norm(self.k_proj(hidden).view(B, 1, self.num_kv_heads, self.head_dim))
-        v = self.v_proj(hidden).view(B, 1, self.num_kv_heads, self.head_dim)
-        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
-
+        """Batched single-token decode over the contiguous active prefix ``[0, B)``."""
+        q, gate, k, v = self._project_qkv(hidden)                       # (B, 1, H_*, D)
         # Per-row position is lengths_after - 1 (0-indexed).
-        positions = (lengths_after - 1).unsqueeze(1)  # (B, 1)
+        positions = (lengths_after - 1).unsqueeze(1)                    # (B, 1)
         cos, sin = self.rotary.cos_sin(positions, q.dtype)
         q, k = apply_partial_rope(q, k, cos, sin)
 
-        # Scatter new K/V into pool at row i, position lengths_after[i]-1, in place.
-        batch_idx = torch.arange(B, device=K_pool.device)
-        write_pos = lengths_after - 1
-        K_pool[batch_idx, :, write_pos, :] = k[:, :, 0, :]
-        V_pool[batch_idx, :, write_pos, :] = v[:, :, 0, :]
-
-        # Attention over the active prefix's max length, masking padded positions per row.
-        full_k = K_pool[:B, :, :max_kv_len, :]
-        full_v = V_pool[:B, :, :max_kv_len, :]
-        full_k = full_k.repeat_interleave(self.num_kv_groups, dim=1)
-        full_v = full_v.repeat_interleave(self.num_kv_groups, dim=1)
-        scores = torch.matmul(q, full_k.transpose(-2, -1)) * self.scaling  # (B, H, 1, max_kv_len)
-        pos_j = torch.arange(max_kv_len, device=q.device)
-        mask = pos_j[None, None, None, :] >= lengths_after[:, None, None, None]
-        scores = scores.masked_fill(mask, float("-inf"))
-        attn = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        out = torch.matmul(attn, full_v).transpose(1, 2).contiguous().reshape(B, 1, -1)
+        out = self._attn_decode(q, k, v, K_pool, V_pool, lengths_after, max_kv_len, B)
+        out = out.reshape(B, 1, self.num_heads * self.head_dim)
         out = out * torch.sigmoid(gate)
         return self.o_proj(out)
 
@@ -762,7 +877,8 @@ class Pool:
         gdn_conv: list[torch.Tensor | None] = []
         for lt in model.layer_types:
             if lt == "full_attention":
-                K = torch.empty(max_batch, model.num_kv_heads, max_len, model.head_dim,
+                # NHD layout: (MAX_BATCH, MAX_LEN, num_kv_heads, head_dim).
+                K = torch.empty(max_batch, max_len, model.num_kv_heads, model.head_dim,
                                 device=model.device, dtype=model.dtype)
                 V = torch.empty_like(K)
                 full_K.append(K); full_V.append(V)
@@ -821,6 +937,57 @@ class StepEngine:
     def submit(self, req: EngineRequest) -> None:
         self.waiting.append(req)
         self.wake.set()
+
+    def warmup(self) -> None:
+        """Pre-compile Triton (GDN) kernels and SDPA backend code paths at the shapes
+        the engine will actually use. Without this, the FIRST benchmark request after a
+        cold server start pays seconds of Triton/cuDNN compilation, badly skewing TTFT.
+        Runs against an empty pool, then resets pool state so real requests start clean.
+
+        Two pieces of warm-up:
+          1. prefill across several T values so the GDN chunked-prefill Triton kernel
+             primes its single-chunk / multi-chunk code paths and the full-attn SDPA
+             prefill kernel tunes for the common shapes.
+          2. batched decode at B=max_batch over a sweep of K-cache lengths so the
+             single-step SDPA MATH path, the GDN fused-recurrent kernel, and the LM
+             head GEMM are all warm before real traffic arrives.
+        """
+        device = self.device
+        max_batch = self.max_batch
+
+        # 1. Single-request prefill warmup at a range of T values.
+        for T_w in (8, 32, 96):
+            dummy_ids = torch.zeros(1, T_w, dtype=torch.long, device=device)
+            self.model.prefill_to_slot(dummy_ids, 0, self.pool)
+
+        # 2. Batched decode warmup at max_batch over a representative K-length sweep
+        # (16 -> ~96, the same range a `max_tokens=64` benchmark hits).
+        dummy_ids = torch.zeros(1, 16, dtype=torch.long, device=device)
+        for slot in range(max_batch):
+            self.model.prefill_to_slot(dummy_ids, slot, self.pool)
+        self.pool.lengths[:max_batch] = 16
+        last_tokens = torch.zeros(max_batch, 1, dtype=torch.long, device=device)
+        for _ in range(80):
+            self.pool.lengths[:max_batch] += 1
+            lengths_after = self.pool.lengths[:max_batch]
+            max_kv_len = int(lengths_after.max().item())
+            self.model.decode_batch(last_tokens, self.pool, max_batch, lengths_after, max_kv_len)
+
+        # 3. Reset pool state so real requests start with zero length.
+        self.pool.lengths.zero_()
+        for K in self.pool.full_K:
+            if K is not None:
+                K.zero_()
+        for V in self.pool.full_V:
+            if V is not None:
+                V.zero_()
+        for s in self.pool.gdn_state:
+            if s is not None:
+                s.zero_()
+        for c in self.pool.gdn_conv:
+            if c is not None:
+                c.zero_()
+        torch.cuda.synchronize()
 
     def start(self) -> None:
         self.task = asyncio.create_task(self._run())
@@ -994,6 +1161,12 @@ async def _lifespan(app: FastAPI):
     max_len = int(os.environ.get("VIBE_MAX_LEN", "4096"))
     step_log_interval = int(os.environ.get("VIBE_STEP_LOG_INTERVAL", "0"))
 
+    attn_backend = select_attn_backend()
+    print(
+        f"[attn] backend={attn_backend} head_dim=256 gqa=16:4 layout=NHD pool=(B,L,H,D)",
+        flush=True,
+    )
+
     print(f"[vibeserve] loading model from {model_dir} on {device} ({dtype})", flush=True)
     t0 = time.perf_counter()
     tok = AutoTokenizer.from_pretrained(model_dir)
@@ -1004,6 +1177,9 @@ async def _lifespan(app: FastAPI):
 
     engine = StepEngine(model, max_batch=max_batch, max_len=max_len,
                         step_log_interval=step_log_interval)
+    t0 = time.perf_counter()
+    engine.warmup()
+    print(f"[vibeserve] warmup completed in {time.perf_counter() - t0:.1f}s", flush=True)
     engine.start()
     print(f"[vibeserve] engine started (MAX_BATCH={max_batch}, MAX_LEN={max_len})", flush=True)
 
