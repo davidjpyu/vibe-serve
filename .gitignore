@@ -1,0 +1,8 @@
+.cache
+.claude
+.git
+__pycache__
+_auth
+_mounts
+_opt_vibeserve
+repos
