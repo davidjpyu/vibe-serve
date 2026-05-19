@@ -81,6 +81,7 @@ except Exception:  # noqa: BLE001
             cache_batch_idx: torch.Tensor,
             softmax_scale: float,
             causal: bool = True,
+            max_seqlen_k_override: int | None = None,
         ) -> torch.Tensor:
             """FA4-paged-varlen adapter mimicking FA2's `flash_attn_with_kvcache`.
 
@@ -90,6 +91,11 @@ except Exception:  # noqa: BLE001
             `(N_SLOTS, max_cache_len, H_kv, D)`. Each row maps to one
             FA-paged "page" via ``page_table=cache_batch_idx[:, None]`` with
             page_block_size = max_cache_len.
+
+            ``max_seqlen_k_override``: when given, used as the static
+            max_seqlen_k passed to FA4 (kernel-launch tuning hint). This is
+            what the CUDA-graph captured path uses — it avoids the
+            ``.item()`` host-sync that the eager bucketing path needs.
             """
             B, Lq, Hq, D = q.shape
             assert Lq == 1, "decode adapter expects q_len==1"
@@ -105,15 +111,20 @@ except Exception:  # noqa: BLE001
             )
             # Visible KV length per row, including the token we just wrote.
             seqused_k = (cache_seqlens.to(torch.int32) + 1)
-            # Bucket max_seqlen_k to powers of two so FA4 reuses cached kernels
-            # across decode steps (FA4 keys its kernel cache on this static
-            # value; without bucketing every new max retriggers a compile).
-            _raw_max = int(seqused_k.max().item())
-            max_seqlen_k = 1
-            while max_seqlen_k < _raw_max:
-                max_seqlen_k <<= 1
-            max_seqlen_k = max(max_seqlen_k, 64)
-            max_seqlen_k = min(max_seqlen_k, k_cache.shape[1])
+            if max_seqlen_k_override is not None:
+                max_seqlen_k = int(max_seqlen_k_override)
+            else:
+                # Eager path: bucket max_seqlen_k to powers of two so FA4
+                # reuses cached kernels across decode steps (FA4 keys its
+                # kernel cache on this static value; without bucketing every
+                # new max retriggers a compile). Requires .item() host-sync,
+                # so this branch is NOT taken on the captured graph.
+                _raw_max = int(seqused_k.max().item())
+                max_seqlen_k = 1
+                while max_seqlen_k < _raw_max:
+                    max_seqlen_k <<= 1
+                max_seqlen_k = max(max_seqlen_k, 64)
+                max_seqlen_k = min(max_seqlen_k, k_cache.shape[1])
             page_table = cache_batch_idx.view(B, 1).to(torch.int32)
 
             out, _ = _fa4_varlen(
@@ -294,6 +305,7 @@ class LlamaAttention(nn.Module):
         max_kv: int,
         is_prefill: bool,
         attn_backend: str,              # "math" or "flash"
+        max_seqlen_k_override: int | None = None,
     ) -> torch.Tensor:
         B, L, _ = hidden_states.shape
 
@@ -309,6 +321,7 @@ class LlamaAttention(nn.Module):
             attn_out_nhd = self._forward_flash(
                 q, k, v, k_cache, v_cache,
                 slot_ids, cache_starts, is_prefill,
+                max_seqlen_k_override=max_seqlen_k_override,
             )
         else:
             attn_out_nhd = self._forward_math(
@@ -332,6 +345,7 @@ class LlamaAttention(nn.Module):
         slot_ids: torch.Tensor,
         cache_starts: torch.Tensor,
         is_prefill: bool,
+        max_seqlen_k_override: int | None = None,
     ) -> torch.Tensor:
         B, L, Hq, D = q.shape
         if is_prefill:
@@ -365,6 +379,7 @@ class LlamaAttention(nn.Module):
             cache_batch_idx=cache_batch_idx,
             softmax_scale=self.scaling,
             causal=True,
+            max_seqlen_k_override=max_seqlen_k_override,
         )  # (B, 1, Hq, D)
 
     def _forward_math(
@@ -444,12 +459,14 @@ class LlamaDecoderLayer(nn.Module):
         max_kv: int,
         is_prefill: bool,
         attn_backend: str,
+        max_seqlen_k_override: int | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         x = self.input_layernorm(hidden_states)
         x = self.self_attn(
             x, cos, sin, k_cache, v_cache,
             slot_ids, cache_starts, attn_mask, max_kv, is_prefill, attn_backend,
+            max_seqlen_k_override=max_seqlen_k_override,
         )
         hidden_states = residual + x
 
@@ -615,6 +632,7 @@ class VibeServeModel(nn.Module):
         cache_starts: torch.Tensor,    # (B,)
         is_prefill: bool,
         attn_backend: str = "math",
+        static_max_kv: int | None = None,
     ) -> torch.Tensor:
         """Run the full stack. Writes K/V into each row's slot at
         [cache_starts[b], cache_starts[b]+L) and returns last-token logits
@@ -623,6 +641,11 @@ class VibeServeModel(nn.Module):
         ``attn_backend`` selects the kernel: "math" runs SDPA[MATH]
         (eager-equivalent — used by ``generate()`` for the accuracy checker);
         "flash" runs FlashAttention (used by the scheduler decode/prefill).
+
+        ``static_max_kv`` is a Python int that bypasses the host-sync that
+        computes ``max_kv`` from ``cache_starts``. Pass ``model.max_cache_len``
+        on the CUDA-graph captured path; FA's ``cache_seqlens`` still controls
+        per-row attention scope so oversizing is correct.
         """
         B, L = input_ids.shape
         device = self.device_
@@ -632,12 +655,19 @@ class VibeServeModel(nn.Module):
         cos = self.cos_cache[position_ids]  # (B, L, head_dim)
         sin = self.sin_cache[position_ids]
 
-        kv_lens = cache_starts.long() + L  # (B,)
-        max_kv = int(kv_lens.max().item())
+        # max_kv: a Python int. On the captured path it's a constant
+        # (max_cache_len) and we skip the .item() host-sync. On the eager
+        # path we compute it from cache_starts.
+        if static_max_kv is not None:
+            max_kv = static_max_kv
+        else:
+            kv_lens = cache_starts.long() + L  # (B,)
+            max_kv = int(kv_lens.max().item())
 
         # Mask only used by SDPA[MATH] decode; FA handles variable lengths.
         attn_mask: torch.Tensor | None = None
         if attn_backend == "math" and not is_prefill:
+            kv_lens = cache_starts.long() + L
             col_idx = torch.arange(max_kv, device=device)
             mask_bool = col_idx.unsqueeze(0) >= kv_lens.unsqueeze(1)
             attn_mask = torch.zeros(B, 1, 1, max_kv, device=device, dtype=self.dtype_)
@@ -653,6 +683,7 @@ class VibeServeModel(nn.Module):
                 x, cos, sin, k_cache, v_cache,
                 slot_ids, cache_starts, attn_mask, max_kv, is_prefill,
                 attn_backend,
+                max_seqlen_k_override=static_max_kv,
             )
         x = self.model.norm(x)
         last_hidden = x[:, -1:, :]  # (B, 1, hidden)
@@ -743,6 +774,22 @@ class Job:
     finish_reason: str = "length"
 
 
+@dataclass
+class CapturedDecodeGraph:
+    """A `torch.cuda.CUDAGraph` capturing the full decode forward at a fixed
+    batch size B, plus the persistent device buffers replays read/write.
+    """
+    bucket: int
+    graph: "torch.cuda.CUDAGraph"
+    input_ids_buf: torch.Tensor     # (B, 1) long
+    slot_ids_buf: torch.Tensor      # (B,) long
+    cache_starts_buf: torch.Tensor  # (B,) long
+    next_tokens_buf: torch.Tensor   # (B,) long — argmax output
+
+
+BATCH_BUCKETS_DEFAULT: tuple[int, ...] = (1, 2, 4, 8, 16)
+
+
 class Scheduler:
     """Background daemon thread; sole GPU consumer. Maintains a slot pool
     and runs prefill (one per tick) + batched decode (all active slots).
@@ -759,6 +806,12 @@ class Scheduler:
         # Pick the attention backend once at startup. FA = scheduler decode +
         # prefill path. SDPA[MATH] fallback only if FA failed to import.
         self.attn_backend = "flash" if _FLASH_ATTN_AVAILABLE else "math"
+        # CUDA-graph state for the steady-state decode path. Keyed by bucket
+        # batch size B; each entry is a CapturedDecodeGraph holding the graph
+        # object plus its persistent device input/output buffers.
+        self.graphs: dict[int, "CapturedDecodeGraph"] = {}
+        # Sorted ascending so _pick_bucket can walk smallest-first.
+        self.graph_buckets: list[int] = []
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self._loop, daemon=True, name="cb-sched")
@@ -877,25 +930,24 @@ class Scheduler:
             job.finished = True
             job.finish_reason = "length"
 
+    # --- decode-step path: graph replay if a bucket fits, else eager -----
+
+    def _pick_bucket(self, n: int) -> int | None:
+        for B in self.graph_buckets:
+            if B >= n:
+                return B
+        return None
+
     @torch.inference_mode()
     def _decode_step(self) -> None:
-        device = self.model.device_
-        B = len(self.active)
-        slot_ids = torch.tensor(
-            [j.slot_id for j in self.active], device=device, dtype=torch.long
-        )
-        cache_starts = torch.tensor(
-            [j.cache_count for j in self.active], device=device, dtype=torch.long
-        )
-        input_ids = torch.tensor(
-            [[j.last_token] for j in self.active], device=device, dtype=torch.long
-        )
-
-        logits = self.model._forward_inner(
-            input_ids, slot_ids=slot_ids, cache_starts=cache_starts,
-            is_prefill=False, attn_backend=self.attn_backend,
-        )  # (B, vocab)
-        next_tokens = logits.argmax(dim=-1).tolist()
+        n = len(self.active)
+        if n == 0:
+            return
+        bucket = self._pick_bucket(n)
+        if bucket is not None and bucket in self.graphs:
+            next_tokens = self._decode_step_graph(bucket, n)
+        else:
+            next_tokens = self._decode_step_eager(n)
 
         for i, job in enumerate(self.active):
             if job.finished:
@@ -913,6 +965,171 @@ class Scheduler:
             if job.n_generated >= job.max_tokens:
                 job.finished = True
                 job.finish_reason = "length"
+
+    def _decode_step_eager(self, n: int) -> list[int]:
+        device = self.model.device_
+        slot_ids = torch.tensor(
+            [j.slot_id for j in self.active], device=device, dtype=torch.long
+        )
+        cache_starts = torch.tensor(
+            [j.cache_count for j in self.active], device=device, dtype=torch.long
+        )
+        input_ids = torch.tensor(
+            [[j.last_token] for j in self.active], device=device, dtype=torch.long
+        )
+        logits = self.model._forward_inner(
+            input_ids, slot_ids=slot_ids, cache_starts=cache_starts,
+            is_prefill=False, attn_backend=self.attn_backend,
+        )  # (n, vocab)
+        return logits.argmax(dim=-1).tolist()
+
+    def _decode_step_graph(self, bucket: int, n: int) -> list[int]:
+        """Copy data into the bucket's persistent buffers, replay, and
+        slice the first ``n`` rows of the next-tokens buffer. Padding rows
+        (rows n..bucket-1) read slot 0 / cache_start 0 / input 0 — their
+        output is discarded.
+        """
+        cg = self.graphs[bucket]
+        device = self.model.device_
+        # Build host-side staging tensors padded with zeros for unused slots.
+        slot_ids_list = [j.slot_id for j in self.active]
+        cache_starts_list = [j.cache_count for j in self.active]
+        last_token_list = [j.last_token for j in self.active]
+        pad = bucket - n
+        if pad:
+            slot_ids_list = slot_ids_list + [0] * pad
+            cache_starts_list = cache_starts_list + [0] * pad
+            last_token_list = last_token_list + [0] * pad
+        # .copy_ is the only host->device transfer per tick (~bucket * 8 bytes
+        # per buffer × 3 buffers = trivial).
+        cg.input_ids_buf.copy_(
+            torch.tensor(last_token_list, device=device, dtype=torch.long)
+            .view(bucket, 1),
+            non_blocking=True,
+        )
+        cg.slot_ids_buf.copy_(
+            torch.tensor(slot_ids_list, device=device, dtype=torch.long),
+            non_blocking=True,
+        )
+        cg.cache_starts_buf.copy_(
+            torch.tensor(cache_starts_list, device=device, dtype=torch.long),
+            non_blocking=True,
+        )
+        cg.graph.replay()
+        # One host-sync per step: read the n real rows of next_tokens.
+        return cg.next_tokens_buf[:n].tolist()
+
+    # ------------------------------------------------------------------
+    # CUDA graph capture (called once at startup)
+    # ------------------------------------------------------------------
+
+    def capture_decode_graphs(
+        self,
+        batch_buckets: tuple[int, ...] = BATCH_BUCKETS_DEFAULT,
+        warmup_iters: int = 5,
+    ) -> None:
+        """Capture one CUDA graph per batch-size bucket. Skipped if FA isn't
+        available (math fallback path uses dynamic-shape masks that don't
+        benefit as cleanly). Failures are logged and per-bucket; the
+        decode_step path will fall back to eager for that bucket.
+        """
+        if self.attn_backend != "flash":
+            print(
+                "[capture] CUDA graphs disabled (FA not available; "
+                "scheduler is on SDPA[MATH] fallback)",
+                flush=True,
+            )
+            return
+        model = self.model
+        device = model.device_
+        max_cache_len = model.max_cache_len
+        valid_buckets = [b for b in batch_buckets if 1 <= b <= self.num_slots]
+        captured: list[int] = []
+        failed: list[tuple[int, str]] = []
+        # Pristine cache: ensure no garbage from FA4 warmup leaks into the
+        # graph's captured K/V writes. The warmup loop below also uses real
+        # cache positions, so reset after capture too.
+        for i in range(model.num_layers):
+            model._buffers[f"_k_cache_{i}"].zero_()
+            model._buffers[f"_v_cache_{i}"].zero_()
+
+        for B in valid_buckets:
+            try:
+                cg = self._capture_one_bucket(B, max_cache_len, warmup_iters)
+                self.graphs[B] = cg
+                captured.append(B)
+            except Exception as exc:  # noqa: BLE001
+                failed.append((B, repr(exc)))
+
+        self.graph_buckets = sorted(self.graphs.keys())
+        # Final reset so the captured warmup writes don't contaminate real
+        # request KV state.
+        for i in range(model.num_layers):
+            model._buffers[f"_k_cache_{i}"].zero_()
+            model._buffers[f"_v_cache_{i}"].zero_()
+        torch.cuda.synchronize()
+        print(
+            f"[capture] CUDA graphs ready: buckets={captured}"
+            + (f", failed={failed}" if failed else ""),
+            flush=True,
+        )
+
+    def _capture_one_bucket(
+        self, B: int, max_cache_len: int, warmup_iters: int,
+    ) -> "CapturedDecodeGraph":
+        model = self.model
+        device = model.device_
+
+        input_ids_buf = torch.zeros((B, 1), device=device, dtype=torch.long)
+        slot_ids_buf = torch.zeros((B,), device=device, dtype=torch.long)
+        cache_starts_buf = torch.zeros((B,), device=device, dtype=torch.long)
+        next_tokens_buf = torch.zeros((B,), device=device, dtype=torch.long)
+
+        # Fill with safe defaults so the warmup forward sees valid metadata.
+        # Each row uses its own slot but cache_starts > 0 to exercise a real
+        # decode shape (FA4 with seqused_k=1 would be too degenerate).
+        slot_ids_buf.copy_(
+            torch.arange(B, device=device, dtype=torch.long)
+        )
+        cache_starts_buf.fill_(max_cache_len // 2)
+
+        # Run warmup iterations in a side stream so any lazy
+        # CUDA-allocator setup, FA4 JIT, etc. complete before capture.
+        s = torch.cuda.Stream(device=device)
+        s.wait_stream(torch.cuda.current_stream(device=device))
+        with torch.cuda.stream(s):
+            with torch.inference_mode():
+                for _ in range(warmup_iters):
+                    logits = model._forward_inner(
+                        input_ids_buf, slot_ids=slot_ids_buf,
+                        cache_starts=cache_starts_buf,
+                        is_prefill=False, attn_backend="flash",
+                        static_max_kv=max_cache_len,
+                    )
+                    next_tokens_buf.copy_(logits.argmax(dim=-1))
+        torch.cuda.current_stream(device=device).wait_stream(s)
+        torch.cuda.synchronize()
+
+        # Capture.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=s):
+            with torch.inference_mode():
+                logits = model._forward_inner(
+                    input_ids_buf, slot_ids=slot_ids_buf,
+                    cache_starts=cache_starts_buf,
+                    is_prefill=False, attn_backend="flash",
+                    static_max_kv=max_cache_len,
+                )
+                next_tokens_buf.copy_(logits.argmax(dim=-1))
+        torch.cuda.synchronize()
+        return CapturedDecodeGraph(
+            bucket=B,
+            graph=graph,
+            input_ids_buf=input_ids_buf,
+            slot_ids_buf=slot_ids_buf,
+            cache_starts_buf=cache_starts_buf,
+            next_tokens_buf=next_tokens_buf,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1044,23 +1261,27 @@ async def lifespan(app: FastAPI):
         max_cache_len=4096, num_slots=n_slots,
     )
     scheduler = Scheduler(model, num_slots=n_slots)
-    scheduler.start()
-
-    STATE["model"] = model
-    STATE["tokenizer"] = tokenizer
-    name = getattr(model.config, "_name_or_path", None) or "llama-3.1-8b-instruct"
-    STATE["model_name"] = name
     # Pre-warm FA4 (CuTeDSL) kernels for the bucketed max_seqlen_k values we
-    # use at decode. CuTeDSL JIT-compiles a fresh kernel per static shape, so
+    # use at decode. CuTeDSL JIT-compiles a fresh kernel per static shape;
     # without pre-warming the first request that hits each bucket pays
     # multi-second compile cost (one-off per (B_active, max_kv_bucket) combo).
     if _FLASH_ATTN_AVAILABLE and _FLASH_ATTN_VARIANT == "fa4":
         _warmup_fa4_kernels(model, num_slots=n_slots)
+    # Capture CUDA graphs for steady-state decode. Run BEFORE starting the
+    # scheduler thread so capture has exclusive GPU access.
+    scheduler.capture_decode_graphs()
 
+    scheduler.start()
+    STATE["model"] = model
+    STATE["tokenizer"] = tokenizer
+    name = getattr(model.config, "_name_or_path", None) or "llama-3.1-8b-instruct"
+    STATE["model_name"] = name
     STATE["scheduler"] = scheduler
     print(
         f"[startup] model + scheduler ready "
-        f"(attn_backend={scheduler.attn_backend}, fa_variant={_FLASH_ATTN_VARIANT})",
+        f"(attn_backend={scheduler.attn_backend}, "
+        f"fa_variant={_FLASH_ATTN_VARIANT}, "
+        f"graph_buckets={scheduler.graph_buckets})",
         flush=True,
     )
     try:
