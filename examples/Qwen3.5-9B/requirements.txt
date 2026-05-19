@@ -1,0 +1,9 @@
+torch>=2.2
+# Qwen3.5-9B needs transformers main branch (per HF model card; the
+# Qwen3_5ForConditionalGeneration class is not in stable releases yet).
+transformers @ git+https://github.com/huggingface/transformers.git@main
+httpx>=0.27
+fastapi>=0.110
+uvicorn>=0.29
+safetensors>=0.4
+accelerate>=0.30
