@@ -1,10 +1,15 @@
-"""Baseline FastAPI server for Llama-3.1-8B-Instruct on H200.
+"""FastAPI inference server for Llama-3.1-8B-Instruct on H200 with continuous batching.
 
-Hand-written model layers (RMSNorm, RoPE with Llama-3 scaling, GQA attention,
-SwiGLU MLP, decoder stack); transformers is used only for the tokenizer and to
-load weights from a local directory. SDPA is used for attention with
-eager-equivalent (math) semantics. KV cache is preallocated per layer and
-written in-place — no torch.cat in the decode path.
+- Hand-written model layers (RMSNorm, RoPE with Llama-3 scaling, GQA attention,
+  SwiGLU MLP, decoder stack); transformers used only for tokenizer + config +
+  weight loading.
+- Per-layer KV cache: (N_SLOTS, num_kv_heads, max_cache_len, head_dim), written
+  in place. No torch.cat in the decode path.
+- Continuous batching: a background daemon thread is the sole GPU consumer.
+  HTTP handlers submit a Job (via thread-safe queue.Queue) and drain tokens
+  from a per-request asyncio.Queue. No asyncio.Lock around forward passes.
+- Attention backend: SDPA with explicit MATH kernel for eager-equivalent
+  semantics (accuracy gate).
 """
 
 from __future__ import annotations
@@ -13,9 +18,12 @@ import asyncio
 import json
 import math
 import os
+import queue
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -121,10 +129,13 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rope(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # q, k: (bsz, num_heads, seq_len, head_dim)
-    # cos, sin: (seq_len, head_dim)
-    cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
-    sin = sin.unsqueeze(0).unsqueeze(0)
+    """Apply rotary embedding.
+
+    q, k: (bsz, num_heads, seq_len, head_dim)
+    cos, sin: (bsz, seq_len, head_dim) — per-row positions
+    """
+    cos = cos.unsqueeze(1)  # (bsz, 1, seq_len, head_dim)
+    sin = sin.unsqueeze(1)
     q_emb = (q * cos) + (_rotate_half(q) * sin)
     k_emb = (k * cos) + (_rotate_half(k) * sin)
     return q_emb, k_emb
@@ -155,55 +166,69 @@ class LlamaAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        cache_start: int,
-        cache_end: int,
+        hidden_states: torch.Tensor,    # (B, L, hidden)
+        cos: torch.Tensor,              # (B, L, head_dim)
+        sin: torch.Tensor,              # (B, L, head_dim)
+        k_cache: torch.Tensor,          # (N_SLOTS, num_kv_heads, max_cache_len, head_dim)
+        v_cache: torch.Tensor,          # same
+        slot_ids: torch.Tensor,         # (B,) long
+        cache_starts: torch.Tensor,     # (B,) long — positions to write into
+        attn_mask: torch.Tensor | None, # additive mask, (B, 1, 1, max_kv) or None
+        max_kv: int,
+        is_prefill: bool,
     ) -> torch.Tensor:
-        bsz, seq_len, _ = hidden_states.shape
+        B, L, _ = hidden_states.shape
+
         q = (
             self.q_proj(hidden_states)
-            .view(bsz, seq_len, self.num_heads, self.head_dim)
+            .view(B, L, self.num_heads, self.head_dim)
             .transpose(1, 2)
-        )  # (bsz, num_heads, seq_len, head_dim)
+        )  # (B, num_heads, L, head_dim)
         k = (
             self.k_proj(hidden_states)
-            .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+            .view(B, L, self.num_kv_heads, self.head_dim)
             .transpose(1, 2)
         )
         v = (
             self.v_proj(hidden_states)
-            .view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+            .view(B, L, self.num_kv_heads, self.head_dim)
             .transpose(1, 2)
         )
 
         q, k = apply_rope(q, k, cos, sin)
 
-        # In-place write to preallocated KV cache (no torch.cat).
-        k_cache[:, :, cache_start:cache_end, :] = k
-        v_cache[:, :, cache_start:cache_end, :] = v
+        # In-place write to preallocated KV cache. No torch.cat.
+        if L == 1:
+            # Decode: scatter via advanced indexing
+            # slot_ids: (B,), cache_starts: (B,)
+            # k: (B, num_kv_heads, 1, head_dim) -> squeeze L dim to (B, num_kv_heads, head_dim)
+            k_cache[slot_ids, :, cache_starts, :] = k[:, :, 0, :]
+            v_cache[slot_ids, :, cache_starts, :] = v[:, :, 0, :]
+        else:
+            # Prefill (B==1 in this round): slice assignment
+            for b in range(B):
+                s = int(slot_ids[b].item())
+                cs = int(cache_starts[b].item())
+                k_cache[s, :, cs : cs + L, :] = k[b]
+                v_cache[s, :, cs : cs + L, :] = v[b]
 
-        k_full = k_cache[:, :, :cache_end, :]
-        v_full = v_cache[:, :, :cache_end, :]
+        # Read the visible prefix [0:max_kv] of each row's slot.
+        # Advanced indexing on dim 0 with slot_ids produces a contiguous (B, ...) copy.
+        k_full = k_cache[slot_ids, :, :max_kv, :]  # (B, num_kv_heads, max_kv, head_dim)
+        v_full = v_cache[slot_ids, :, :max_kv, :]
 
-        # Causal mask only matters in prefill (seq_len > 1, kv_len == seq_len).
-        # In decode (seq_len == 1) the single query attends to all of [0:cache_end].
-        is_causal = seq_len > 1 and cache_start == 0
         with sdpa_kernel([SDPBackend.MATH]):
             attn_out = F.scaled_dot_product_attention(
                 q,
                 k_full,
                 v_full,
-                attn_mask=None,
+                attn_mask=attn_mask,
                 dropout_p=0.0,
-                is_causal=is_causal,
+                is_causal=is_prefill,  # only the prefill case (q_len==kv_len)
                 scale=self.scaling,
                 enable_gqa=True,
             )
-        attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, self.hidden_size)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, self.hidden_size)
         return self.o_proj(attn_out)
 
 
@@ -233,12 +258,18 @@ class LlamaDecoderLayer(nn.Module):
         sin: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        cache_start: int,
-        cache_end: int,
+        slot_ids: torch.Tensor,
+        cache_starts: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        max_kv: int,
+        is_prefill: bool,
     ) -> torch.Tensor:
         residual = hidden_states
         x = self.input_layernorm(hidden_states)
-        x = self.self_attn(x, cos, sin, k_cache, v_cache, cache_start, cache_end)
+        x = self.self_attn(
+            x, cos, sin, k_cache, v_cache,
+            slot_ids, cache_starts, attn_mask, max_kv, is_prefill,
+        )
         hidden_states = residual + x
 
         residual = hidden_states
@@ -257,11 +288,17 @@ class LlamaInner(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
-class VibeServeModel(nn.Module):
-    """Llama-3.1 forward / greedy generation wrapper.
+# ---------------------------------------------------------------------------
+# VibeServeModel — owns weights, KV cache buffers, RoPE cache
+# ---------------------------------------------------------------------------
 
-    Per-layer KV cache buffers are preallocated to ``max_cache_len`` so the
-    decode loop performs in-place writes (no per-token ``torch.cat``).
+
+class VibeServeModel(nn.Module):
+    """Llama-3.1 forward + greedy generation, batched continuous-decode-ready.
+
+    KV cache is shape (N_SLOTS, num_kv_heads, max_cache_len, head_dim), one
+    pair (K, V) per decoder layer. Slots are owned by the scheduler in serving;
+    `generate()` uses slot 0 in isolation for the accuracy checker.
     """
 
     def __init__(
@@ -270,12 +307,14 @@ class VibeServeModel(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
         max_cache_len: int = 4096,
+        num_slots: int = 16,
     ):
         super().__init__()
         self.config = config
         self.device_ = device
         self.dtype_ = dtype
         self.max_cache_len = max_cache_len
+        self.num_slots = num_slots
 
         self.model = LlamaInner(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -284,12 +323,11 @@ class VibeServeModel(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
 
-        # KV cache buffers — non-persistent so they don't appear in state_dict.
         for i in range(self.num_layers):
             self.register_buffer(
                 f"_k_cache_{i}",
                 torch.zeros(
-                    1, self.num_kv_heads, max_cache_len, self.head_dim,
+                    num_slots, self.num_kv_heads, max_cache_len, self.head_dim,
                     device=device, dtype=dtype,
                 ),
                 persistent=False,
@@ -297,7 +335,7 @@ class VibeServeModel(nn.Module):
             self.register_buffer(
                 f"_v_cache_{i}",
                 torch.zeros(
-                    1, self.num_kv_heads, max_cache_len, self.head_dim,
+                    num_slots, self.num_kv_heads, max_cache_len, self.head_dim,
                     device=device, dtype=dtype,
                 ),
                 persistent=False,
@@ -336,12 +374,16 @@ class VibeServeModel(nn.Module):
         device: str | torch.device,
         dtype: torch.dtype,
         max_cache_len: int = 4096,
+        num_slots: int = 16,
     ) -> "VibeServeModel":
         model_dir = str(model_dir)
         device = torch.device(device)
         config = AutoConfig.from_pretrained(model_dir)
 
-        model = cls(config, device=device, dtype=dtype, max_cache_len=max_cache_len)
+        model = cls(
+            config, device=device, dtype=dtype,
+            max_cache_len=max_cache_len, num_slots=num_slots,
+        )
 
         index_path = os.path.join(model_dir, "model.safetensors.index.json")
         if os.path.exists(index_path):
@@ -361,7 +403,6 @@ class VibeServeModel(nn.Module):
                 state_dict[k] = v.to(dtype)
 
         if "lm_head.weight" not in state_dict:
-            # tied embeddings fallback
             state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
 
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -376,40 +417,62 @@ class VibeServeModel(nn.Module):
         ]
         if real_missing:
             raise RuntimeError(f"missing weights: {real_missing[:5]} ...")
-        # Ignore extras such as inv_freq buffers.
-
         model.to(device=device, dtype=dtype)
         model.eval()
         return model
 
     # ------------------------------------------------------------------
-    # Forward
+    # Forward (batched-capable)
     # ------------------------------------------------------------------
 
     def _forward_inner(
-        self, input_ids: torch.Tensor, cache_start: int
+        self,
+        input_ids: torch.Tensor,       # (B, L)
+        slot_ids: torch.Tensor,        # (B,)
+        cache_starts: torch.Tensor,    # (B,)
+        is_prefill: bool,
     ) -> torch.Tensor:
-        """Run the stack and return last-token logits.
-
-        Writes K/V into the preallocated cache at positions
-        [cache_start, cache_start + input_ids.shape[1]).
+        """Run the full stack. Writes K/V into each row's slot at
+        [cache_starts[b], cache_starts[b]+L) and returns last-token logits
+        of shape (B, vocab).
         """
-        seq_len = input_ids.shape[1]
-        cache_end = cache_start + seq_len
+        B, L = input_ids.shape
+        device = self.device_
 
-        positions = torch.arange(
-            cache_start, cache_end, device=self.device_, dtype=torch.long
-        )
-        cos = self.cos_cache.index_select(0, positions)  # (seq_len, head_dim)
-        sin = self.sin_cache.index_select(0, positions)
+        # Per-row positions: cache_starts[b] + [0..L-1]
+        offsets = torch.arange(L, device=device, dtype=torch.long)
+        position_ids = cache_starts.unsqueeze(1) + offsets.unsqueeze(0)  # (B, L)
+        cos = self.cos_cache[position_ids]  # (B, L, head_dim)
+        sin = self.sin_cache[position_ids]
+
+        # kv_lens (visible after writing the new L tokens): cache_starts + L
+        kv_lens = cache_starts + L  # (B,)
+        max_kv = int(kv_lens.max().item())
+
+        if is_prefill:
+            attn_mask = None  # use is_causal=True
+        else:
+            # Decode (L==1): need additive mask covering padding positions.
+            # mask[b, 0, 0, j] = -inf if j >= kv_lens[b], else 0
+            col_idx = torch.arange(max_kv, device=device)  # (max_kv,)
+            mask_bool = col_idx.unsqueeze(0) >= kv_lens.unsqueeze(1)  # (B, max_kv)
+            attn_mask = torch.zeros(B, 1, 1, max_kv, device=device, dtype=self.dtype_)
+            attn_mask.masked_fill_(
+                mask_bool.unsqueeze(1).unsqueeze(1), float("-inf")
+            )
 
         x = self.model.embed_tokens(input_ids)
         for i, layer in enumerate(self.model.layers):
             k_cache = self._buffers[f"_k_cache_{i}"]
             v_cache = self._buffers[f"_v_cache_{i}"]
-            x = layer(x, cos, sin, k_cache, v_cache, cache_start, cache_end)
+            x = layer(
+                x, cos, sin, k_cache, v_cache,
+                slot_ids, cache_starts, attn_mask, max_kv, is_prefill,
+            )
         x = self.model.norm(x)
-        return self.lm_head(x[:, -1:, :])  # (1, 1, vocab)
+        # logits for the last token of each row
+        last_hidden = x[:, -1:, :]  # (B, 1, hidden)
+        return self.lm_head(last_hidden).squeeze(1)  # (B, vocab)
 
     @torch.inference_mode()
     def generate(
@@ -417,8 +480,12 @@ class VibeServeModel(nn.Module):
         input_ids: torch.Tensor,
         max_new_tokens: int = 16,
         eos_token_ids: list[int] | None = None,
+        slot_id: int = 0,
     ) -> torch.Tensor:
-        """Greedy generation. Returns (1, prompt_len + generated_len) tensor."""
+        """Greedy generation using slot `slot_id` (default 0). Returns
+        (1, prompt_len + generated_len). Bit-identical to the round-1
+        single-stream path for batch=1 because no masking/padding is applied.
+        """
         if eos_token_ids is None:
             cfg_eos = getattr(self.config, "eos_token_id", None)
             if isinstance(cfg_eos, list):
@@ -436,30 +503,231 @@ class VibeServeModel(nn.Module):
                 f"exceeds max_cache_len ({self.max_cache_len})"
             )
 
+        slot_ids = torch.tensor([slot_id], device=self.device_, dtype=torch.long)
+        cache_starts = torch.tensor([0], device=self.device_, dtype=torch.long)
+
         # Prefill
-        logits = self._forward_inner(input_ids, cache_start=0)
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (1, 1)
-        generated_tokens = [next_token]
-        # `cache_count` = number of tokens currently committed to the KV cache
+        logits = self._forward_inner(
+            input_ids, slot_ids=slot_ids, cache_starts=cache_starts, is_prefill=True,
+        )
+        next_token = int(logits.argmax(dim=-1).item())
+        generated = [next_token]
         cache_count = prompt_len
 
         for _ in range(max_new_tokens - 1):
-            if int(next_token.item()) in eos_token_ids:
+            if next_token in eos_token_ids:
                 break
-            # Write the just-sampled token at position `cache_count`
-            logits = self._forward_inner(next_token, cache_start=cache_count)
+            nt = torch.tensor([[next_token]], device=self.device_, dtype=torch.long)
+            cs = torch.tensor([cache_count], device=self.device_, dtype=torch.long)
+            logits = self._forward_inner(
+                nt, slot_ids=slot_ids, cache_starts=cs, is_prefill=False,
+            )
             cache_count += 1
-            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            generated_tokens.append(next_token)
+            next_token = int(logits.argmax(dim=-1).item())
+            generated.append(next_token)
 
-        return torch.cat([input_ids] + generated_tokens, dim=1)
+        gen_tensor = torch.tensor([generated], device=self.device_, dtype=torch.long)
+        return torch.cat([input_ids, gen_tensor], dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Continuous-batching scheduler
+# ---------------------------------------------------------------------------
+
+EOS_TOKEN_IDS: tuple[int, ...] = (128001, 128008, 128009)
+
+# Sentinel marker pushed to a request's token queue when generation ends.
+# Payload: ("done", finish_reason)
+
+
+@dataclass
+class Job:
+    request_id: str
+    prompt_ids: list[int]
+    max_tokens: int
+    token_queue: asyncio.Queue
+    event_loop: asyncio.AbstractEventLoop
+
+    # Filled by scheduler
+    slot_id: int | None = None
+    cache_count: int = 0
+    n_generated: int = 0
+    last_token: int = -1
+    finished: bool = False
+    finish_reason: str = "length"
+
+
+class Scheduler:
+    """Background daemon thread; sole GPU consumer. Maintains a slot pool
+    and runs prefill (one per tick) + batched decode (all active slots).
+    """
+
+    def __init__(self, model: VibeServeModel, num_slots: int):
+        self.model = model
+        self.num_slots = num_slots
+        self.free_slots: list[int] = list(range(num_slots))
+        self.active: list[Job] = []
+        self.wait_queue: queue.Queue[Job] = queue.Queue()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="cb-sched")
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+
+    def submit(self, job: Job) -> None:
+        self.wait_queue.put(job)
+
+    # --- internal -----------------------------------------------------
+
+    def _push_token(self, job: Job, token: int) -> None:
+        job.event_loop.call_soon_threadsafe(job.token_queue.put_nowait, token)
+
+    def _finalize(self, job: Job) -> None:
+        job.event_loop.call_soon_threadsafe(
+            job.token_queue.put_nowait, ("done", job.finish_reason),
+        )
+        if job.slot_id is not None:
+            self.free_slots.append(job.slot_id)
+            job.slot_id = None
+
+    def _loop(self) -> None:
+        device = self.model.device_
+        while not self.stop_event.is_set():
+            # 1. Admit at most one new request per tick
+            new_job: Job | None = None
+            if self.free_slots:
+                try:
+                    new_job = self.wait_queue.get_nowait()
+                except queue.Empty:
+                    new_job = None
+
+            if new_job is not None:
+                new_job.slot_id = self.free_slots.pop(0)
+                try:
+                    self._prefill(new_job)
+                except Exception as exc:
+                    new_job.finished = True
+                    new_job.finish_reason = "stop"
+                    self._finalize(new_job)
+                    print(f"[scheduler] prefill error: {exc}", flush=True)
+                    continue
+                if new_job.finished:
+                    self._finalize(new_job)
+                else:
+                    self.active.append(new_job)
+
+            # 2. Decode (batched) if anyone is active
+            if not self.active:
+                if new_job is None:
+                    # idle — brief sleep so we don't spin the CPU
+                    time.sleep(0.001)
+                continue
+
+            try:
+                self._decode_step()
+            except Exception as exc:
+                print(f"[scheduler] decode error: {exc}", flush=True)
+                # On a hard error, finish all in-flight jobs to avoid stalled
+                # streams; surface a stop finish_reason.
+                for j in self.active:
+                    j.finished = True
+                    j.finish_reason = "stop"
+
+            # 3. Clean up finished jobs
+            still: list[Job] = []
+            for j in self.active:
+                if j.finished:
+                    self._finalize(j)
+                else:
+                    still.append(j)
+            self.active = still
+
+        # Stopped: drain in-flight jobs
+        for j in self.active:
+            j.finished = True
+            j.finish_reason = "stop"
+            self._finalize(j)
+        self.active = []
+
+    @torch.inference_mode()
+    def _prefill(self, job: Job) -> None:
+        device = self.model.device_
+        prompt_len = len(job.prompt_ids)
+        if prompt_len + job.max_tokens > self.model.max_cache_len:
+            # Truncate the generation budget so we don't overflow the cache.
+            job.max_tokens = max(1, self.model.max_cache_len - prompt_len)
+
+        prompt = torch.tensor(
+            [job.prompt_ids], device=device, dtype=torch.long
+        )
+        slot_ids = torch.tensor([job.slot_id], device=device, dtype=torch.long)
+        cache_starts = torch.tensor([0], device=device, dtype=torch.long)
+
+        logits = self.model._forward_inner(
+            prompt, slot_ids=slot_ids, cache_starts=cache_starts, is_prefill=True,
+        )  # (1, vocab)
+        next_token = int(logits.argmax(dim=-1).item())
+        job.cache_count = prompt_len
+        job.n_generated = 1
+        job.last_token = next_token
+
+        if next_token in EOS_TOKEN_IDS:
+            job.finished = True
+            job.finish_reason = "stop"
+            return
+
+        self._push_token(job, next_token)
+        if job.n_generated >= job.max_tokens:
+            job.finished = True
+            job.finish_reason = "length"
+
+    @torch.inference_mode()
+    def _decode_step(self) -> None:
+        device = self.model.device_
+        B = len(self.active)
+        slot_ids = torch.tensor(
+            [j.slot_id for j in self.active], device=device, dtype=torch.long
+        )
+        cache_starts = torch.tensor(
+            [j.cache_count for j in self.active], device=device, dtype=torch.long
+        )
+        input_ids = torch.tensor(
+            [[j.last_token] for j in self.active], device=device, dtype=torch.long
+        )
+
+        logits = self.model._forward_inner(
+            input_ids, slot_ids=slot_ids, cache_starts=cache_starts,
+            is_prefill=False,
+        )  # (B, vocab)
+        next_tokens = logits.argmax(dim=-1).tolist()
+
+        for i, job in enumerate(self.active):
+            if job.finished:
+                continue
+            nt = int(next_tokens[i])
+            job.cache_count += 1
+            job.n_generated += 1
+            job.last_token = nt
+
+            if nt in EOS_TOKEN_IDS:
+                job.finished = True
+                job.finish_reason = "stop"
+                continue
+            self._push_token(job, nt)
+            if job.n_generated >= job.max_tokens:
+                job.finished = True
+                job.finish_reason = "length"
 
 
 # ---------------------------------------------------------------------------
 # FastAPI server
 # ---------------------------------------------------------------------------
-
-EOS_TOKEN_IDS = (128001, 128008, 128009)
 
 
 class CompletionRequest(BaseModel):
@@ -497,7 +765,6 @@ def _model_dir() -> str:
     for c in ["/model", "../model", "./model"]:
         if Path(c).exists():
             return str(Path(c).resolve())
-    # Fallback: read symlink target file from reference/
     sym = Path("reference/model.symlink_target")
     if sym.exists():
         target = sym.read_text().strip()
@@ -506,23 +773,35 @@ def _model_dir() -> str:
     raise RuntimeError("model directory not found; set MODEL_DIR env var")
 
 
+N_SLOTS_DEFAULT = int(os.environ.get("N_SLOTS", "16"))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     model_dir = _model_dir()
-    print(f"[startup] loading model from {model_dir}", flush=True)
+    n_slots = N_SLOTS_DEFAULT
+    print(f"[startup] loading model from {model_dir} (slots={n_slots})", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = VibeServeModel.from_pretrained(
-        model_dir, device="cuda:0", dtype=torch.float16, max_cache_len=4096
+        model_dir, device="cuda:0", dtype=torch.float16,
+        max_cache_len=4096, num_slots=n_slots,
     )
+    scheduler = Scheduler(model, num_slots=n_slots)
+    scheduler.start()
+
     STATE["model"] = model
     STATE["tokenizer"] = tokenizer
     name = getattr(model.config, "_name_or_path", None) or "llama-3.1-8b-instruct"
     STATE["model_name"] = name
-    STATE["lock"] = asyncio.Lock()
-    print("[startup] model ready", flush=True)
-    yield
+    STATE["scheduler"] = scheduler
+    print("[startup] model + scheduler ready", flush=True)
+    try:
+        yield
+    finally:
+        print("[shutdown] stopping scheduler", flush=True)
+        scheduler.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -551,7 +830,7 @@ async def list_models() -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Streaming generation core
+# Per-request streaming helpers
 # ---------------------------------------------------------------------------
 
 
@@ -563,47 +842,7 @@ def _utf8_safe_decode(
     full = tokenizer.decode(all_ids, skip_special_tokens=True)
     if "�" in full[emitted_text_len:]:
         return "", emitted_text_len
-    new_text = full[emitted_text_len:]
-    return new_text, len(full)
-
-
-def _step_generate(
-    model: VibeServeModel,
-    prompt_ids_list: list[int],
-    max_new_tokens: int,
-    eos_ids: tuple[int, ...] = EOS_TOKEN_IDS,
-):
-    """Generator yielding token ids for greedy decoding on the static KV cache."""
-    device = model.device_
-    prompt = torch.tensor([prompt_ids_list], device=device, dtype=torch.long)
-    prompt_len = prompt.shape[1]
-
-    if prompt_len + max_new_tokens > model.max_cache_len:
-        max_new_tokens = max(1, model.max_cache_len - prompt_len)
-
-    with torch.inference_mode():
-        logits = model._forward_inner(prompt, cache_start=0)
-        next_token = int(logits[:, -1, :].argmax(dim=-1).item())
-
-    yield next_token
-    if next_token in eos_ids:
-        return
-    cache_count = prompt_len
-
-    for _ in range(max_new_tokens - 1):
-        with torch.inference_mode():
-            nt = torch.tensor([[next_token]], device=device, dtype=torch.long)
-            logits = model._forward_inner(nt, cache_start=cache_count)
-        cache_count += 1
-        next_token = int(logits[:, -1, :].argmax(dim=-1).item())
-        yield next_token
-        if next_token in eos_ids:
-            return
-
-
-# ---------------------------------------------------------------------------
-# /v1/completions
-# ---------------------------------------------------------------------------
+    return full[emitted_text_len:], len(full)
 
 
 def _completion_chunk(
@@ -621,95 +860,115 @@ def _completion_chunk(
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-async def _completion_stream(prompt_text: str, max_tokens: int):
-    model: VibeServeModel = STATE["model"]
+def _chat_chunk(
+    cmpl_id: str, model_name: str, delta_content: str | None,
+    finish_reason: str | None,
+) -> str:
+    delta: dict[str, Any] = {}
+    if delta_content is not None:
+        delta["content"] = delta_content
+    payload = {
+        "id": cmpl_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [
+            {"index": 0, "delta": delta, "finish_reason": finish_reason}
+        ],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _submit_and_drain(
+    prompt_ids: list[int], max_tokens: int
+) -> tuple[asyncio.Queue, Job]:
+    """Build a Job and submit it to the scheduler. Returns the (queue, job)."""
+    scheduler: Scheduler = STATE["scheduler"]
+    loop = asyncio.get_running_loop()
+    token_queue: asyncio.Queue = asyncio.Queue()
+    job = Job(
+        request_id=uuid.uuid4().hex,
+        prompt_ids=prompt_ids,
+        max_tokens=max_tokens,
+        token_queue=token_queue,
+        event_loop=loop,
+    )
+    scheduler.submit(job)
+    return token_queue, job
+
+
+# ---------------------------------------------------------------------------
+# /v1/completions
+# ---------------------------------------------------------------------------
+
+
+async def _completion_stream(
+    prompt_text: str, max_tokens: int, prompt_ids: list[int]
+):
     tokenizer = STATE["tokenizer"]
-    lock: asyncio.Lock = STATE["lock"]
     model_name = STATE["model_name"]
-
     cmpl_id = f"cmpl-{uuid.uuid4().hex[:24]}"
-    prompt_ids: list[int] = tokenizer(prompt_text, add_special_tokens=True).input_ids
 
-    async with lock:
-        loop = asyncio.get_running_loop()
-        q: asyncio.Queue = asyncio.Queue()
-        SENTINEL = object()
+    token_queue, _job = await _submit_and_drain(prompt_ids, max_tokens)
 
-        def producer():
-            try:
-                for tok in _step_generate(model, prompt_ids, max_tokens):
-                    asyncio.run_coroutine_threadsafe(q.put(tok), loop).result()
-            except Exception as e:
-                asyncio.run_coroutine_threadsafe(q.put(("ERR", str(e))), loop).result()
-            finally:
-                asyncio.run_coroutine_threadsafe(q.put(SENTINEL), loop).result()
+    emitted_ids: list[int] = []
+    emitted_text_len = 0
+    finish_reason: str = "length"
 
-        fut = loop.run_in_executor(None, producer)
+    while True:
+        item = await token_queue.get()
+        if isinstance(item, tuple) and item and item[0] == "done":
+            finish_reason = item[1]
+            break
+        tok = int(item)
+        emitted_ids.append(tok)
+        new_text, emitted_text_len = _utf8_safe_decode(
+            tokenizer, emitted_ids, emitted_text_len
+        )
+        if new_text:
+            yield _completion_chunk(cmpl_id, model_name, new_text, None)
 
-        emitted_ids: list[int] = []
-        emitted_text_len = 0
-        completion_tokens = 0
-        finish_reason: str | None = None
+    # Flush any held-back UTF-8 (final decode)
+    final_full = tokenizer.decode(emitted_ids, skip_special_tokens=True)
+    leftover = final_full[emitted_text_len:]
+    if leftover:
+        yield _completion_chunk(cmpl_id, model_name, leftover, None)
 
-        while True:
-            item = await q.get()
-            if item is SENTINEL:
-                break
-            if isinstance(item, tuple) and item[0] == "ERR":
-                finish_reason = "stop"
-                break
-            tok = int(item)
-            if tok in EOS_TOKEN_IDS:
-                finish_reason = "stop"
-                break
-            emitted_ids.append(tok)
-            completion_tokens += 1
-            new_text, emitted_text_len = _utf8_safe_decode(
-                tokenizer, emitted_ids, emitted_text_len
-            )
-            if new_text:
-                yield _completion_chunk(cmpl_id, model_name, new_text, None)
-
-        if finish_reason is None:
-            finish_reason = "length" if completion_tokens >= max_tokens else "stop"
-
-        yield _completion_chunk(cmpl_id, model_name, "", finish_reason)
-        yield "data: [DONE]\n\n"
-        await fut
+    yield _completion_chunk(cmpl_id, model_name, "", finish_reason)
+    yield "data: [DONE]\n\n"
 
 
 @app.post("/v1/completions")
 async def completions(req: CompletionRequest):
+    tokenizer = STATE["tokenizer"]
     if isinstance(req.prompt, list):
         prompt_text = req.prompt[0] if req.prompt else ""
     else:
         prompt_text = req.prompt
 
+    prompt_ids: list[int] = tokenizer(
+        prompt_text, add_special_tokens=True
+    ).input_ids
+
     if req.stream:
         return StreamingResponse(
-            _completion_stream(prompt_text, req.max_tokens),
+            _completion_stream(prompt_text, req.max_tokens, prompt_ids),
             media_type="text/event-stream",
         )
 
-    model: VibeServeModel = STATE["model"]
-    tokenizer = STATE["tokenizer"]
-    lock: asyncio.Lock = STATE["lock"]
+    # Non-streaming path: still goes through the scheduler.
     model_name = STATE["model_name"]
-
-    prompt_ids: list[int] = tokenizer(prompt_text, add_special_tokens=True).input_ids
     cmpl_id = f"cmpl-{uuid.uuid4().hex[:24]}"
+    token_queue, _job = await _submit_and_drain(prompt_ids, req.max_tokens)
 
-    async with lock:
-        def run():
-            out: list[int] = []
-            for tok in _step_generate(model, prompt_ids, req.max_tokens):
-                if tok in EOS_TOKEN_IDS:
-                    return out, "stop"
-                out.append(tok)
-            return out, ("length" if len(out) >= req.max_tokens else "stop")
-
-        loop = asyncio.get_running_loop()
-        out_ids, finish_reason = await loop.run_in_executor(None, run)
+    out_ids: list[int] = []
+    finish_reason = "length"
+    while True:
+        item = await token_queue.get()
+        if isinstance(item, tuple) and item and item[0] == "done":
+            finish_reason = item[1]
+            break
+        out_ids.append(int(item))
 
     text = tokenizer.decode(out_ids, skip_special_tokens=True)
     return JSONResponse(
@@ -735,90 +994,48 @@ async def completions(req: CompletionRequest):
 # ---------------------------------------------------------------------------
 
 
-def _chat_chunk(
-    cmpl_id: str, model_name: str, delta_content: str | None,
-    finish_reason: str | None,
-) -> str:
-    delta: dict[str, Any] = {}
-    if delta_content is not None:
-        delta["content"] = delta_content
-    payload = {
+async def _chat_stream(prompt_ids: list[int], max_tokens: int):
+    tokenizer = STATE["tokenizer"]
+    model_name = STATE["model_name"]
+    cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+    token_queue, _job = await _submit_and_drain(prompt_ids, max_tokens)
+
+    # First chunk: role assistant
+    first = {
         "id": cmpl_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model_name,
         "choices": [
-            {"index": 0, "delta": delta, "finish_reason": finish_reason}
+            {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
         ],
     }
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
 
+    emitted_ids: list[int] = []
+    emitted_text_len = 0
+    finish_reason: str = "length"
+    while True:
+        item = await token_queue.get()
+        if isinstance(item, tuple) and item and item[0] == "done":
+            finish_reason = item[1]
+            break
+        tok = int(item)
+        emitted_ids.append(tok)
+        new_text, emitted_text_len = _utf8_safe_decode(
+            tokenizer, emitted_ids, emitted_text_len
+        )
+        if new_text:
+            yield _chat_chunk(cmpl_id, model_name, new_text, None)
 
-async def _chat_stream(prompt_ids: list[int], max_tokens: int):
-    model: VibeServeModel = STATE["model"]
-    tokenizer = STATE["tokenizer"]
-    lock: asyncio.Lock = STATE["lock"]
-    model_name = STATE["model_name"]
+    final_full = tokenizer.decode(emitted_ids, skip_special_tokens=True)
+    leftover = final_full[emitted_text_len:]
+    if leftover:
+        yield _chat_chunk(cmpl_id, model_name, leftover, None)
 
-    cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-
-    async with lock:
-        loop = asyncio.get_running_loop()
-        q: asyncio.Queue = asyncio.Queue()
-        SENTINEL = object()
-
-        def producer():
-            try:
-                for tok in _step_generate(model, prompt_ids, max_tokens):
-                    asyncio.run_coroutine_threadsafe(q.put(tok), loop).result()
-            except Exception as e:
-                asyncio.run_coroutine_threadsafe(q.put(("ERR", str(e))), loop).result()
-            finally:
-                asyncio.run_coroutine_threadsafe(q.put(SENTINEL), loop).result()
-
-        fut = loop.run_in_executor(None, producer)
-
-        first = {
-            "id": cmpl_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model_name,
-            "choices": [
-                {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
-            ],
-        }
-        yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
-
-        emitted_ids: list[int] = []
-        emitted_text_len = 0
-        completion_tokens = 0
-        finish_reason: str | None = None
-
-        while True:
-            item = await q.get()
-            if item is SENTINEL:
-                break
-            if isinstance(item, tuple) and item[0] == "ERR":
-                finish_reason = "stop"
-                break
-            tok = int(item)
-            if tok in EOS_TOKEN_IDS:
-                finish_reason = "stop"
-                break
-            emitted_ids.append(tok)
-            completion_tokens += 1
-            new_text, emitted_text_len = _utf8_safe_decode(
-                tokenizer, emitted_ids, emitted_text_len
-            )
-            if new_text:
-                yield _chat_chunk(cmpl_id, model_name, new_text, None)
-
-        if finish_reason is None:
-            finish_reason = "length" if completion_tokens >= max_tokens else "stop"
-
-        yield _chat_chunk(cmpl_id, model_name, "", finish_reason)
-        yield "data: [DONE]\n\n"
-        await fut
+    yield _chat_chunk(cmpl_id, model_name, "", finish_reason)
+    yield "data: [DONE]\n\n"
 
 
 @app.post("/v1/chat/completions")
@@ -828,7 +1045,9 @@ async def chat_completions(req: ChatCompletionRequest):
     prompt_text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    prompt_ids: list[int] = tokenizer(prompt_text, add_special_tokens=False).input_ids
+    prompt_ids: list[int] = tokenizer(
+        prompt_text, add_special_tokens=False
+    ).input_ids
 
     if req.stream:
         return StreamingResponse(
@@ -836,22 +1055,18 @@ async def chat_completions(req: ChatCompletionRequest):
             media_type="text/event-stream",
         )
 
-    model: VibeServeModel = STATE["model"]
-    lock: asyncio.Lock = STATE["lock"]
     model_name = STATE["model_name"]
     cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    token_queue, _job = await _submit_and_drain(prompt_ids, req.max_tokens)
 
-    async with lock:
-        def run():
-            out: list[int] = []
-            for tok in _step_generate(model, prompt_ids, req.max_tokens):
-                if tok in EOS_TOKEN_IDS:
-                    return out, "stop"
-                out.append(tok)
-            return out, ("length" if len(out) >= req.max_tokens else "stop")
-
-        loop = asyncio.get_running_loop()
-        out_ids, finish_reason = await loop.run_in_executor(None, run)
+    out_ids: list[int] = []
+    finish_reason = "length"
+    while True:
+        item = await token_queue.get()
+        if isinstance(item, tuple) and item and item[0] == "done":
+            finish_reason = item[1]
+            break
+        out_ids.append(int(item))
 
     text = tokenizer.decode(out_ids, skip_special_tokens=True)
     return JSONResponse(

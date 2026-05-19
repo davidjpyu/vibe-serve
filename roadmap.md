@@ -22,52 +22,88 @@ are bucketable so CUDA graphs apply. All three optimization-floor items are
 in scope. After the floor is in place, speculative decoding (EAGLE3 / draft
 model) is the obvious next win on a single-batch tail (low Poisson rate).
 
+## Round-1 baseline & profile recap
+
+- **Baseline (round 1)**: 36.38 aggregate tok/s @ rate=1, max_tokens=128.
+  TPOT median 27.3 ms, TTFT P99 22.35s (TTFT is huge because the asyncio.Lock
+  fully serializes requests — request N waits for request N-1 to finish all
+  128 tokens before its prefill even runs).
+- **Profile verdict**: LAUNCH-BOUND. Decode step = 31.98 ms wall / 5.7 ms GPU
+  busy = 18% GPU utilization. 1,468 kernels/step. 988k cudaLaunchKernel
+  calls in the 25s window. GPU-busy across the whole benchmark = 16.7%.
+  Zero CUDA graphs active. SDPA pinned to MATH backend for acc parity.
+- **Bottleneck order from the profile**: (1) launch overhead → CUDA graphs;
+  (2) cuBLAS GEMM dominance + softmax+matmul split in SDPA[MATH] →
+  FlashAttention; (3) request serialization (9 idle gaps of 10-11 ms between
+  requests) → continuous batching. The profile's suggested execution order
+  was G → A → B → D → E → C → F → H (token-tape-on-device → CUDA graphs →
+  FlashAttention → continuous batching → fused norms → cat-free RoPE …).
+
+## Strategy update after round-1 profile
+
+The optimization-floor priority *order* (continuous batching → attention
+kernel → CUDA graphs) and the profile's suggested *order* (CUDA graphs →
+FA → continuous batching) disagree, because they optimize different things:
+the floor maximizes aggregate tok/s on a multi-request workload, while the
+profile's single-stream view maximizes per-stream tok/s. The headline metric
+is **aggregate tok/s**, and the benchmark drives **Poisson arrivals at
+rate≥1**, so the floor's ordering is the right one for *this* objective.
+
+Continuous batching first is also a structural change — it forces the KV
+cache, the scheduler, and the per-request streaming queues into the shapes
+that FlashAttention's varlen and CUDA-graph-bucketed decode will need
+anyway. Doing CUDA graphs first means re-doing them with batch ≥ 1 a round
+later. So we keep the floor ordering: CB → FA → CUDA graphs → workload-
+specific wins.
+
 ## Major
 
-- **M1. Baseline FastAPI server with hand-written Llama** — `todo` — rounds: 0.
-  *Why*: nothing exists yet. Need a correct, working baseline that passes the
-  accuracy checker and serves both `/v1/completions` and `/v1/chat/completions`
-  with streaming SSE. Without this every subsequent perf optimization has
-  nowhere to land.
+- **M1. Baseline FastAPI server with hand-written Llama** — `done` —
+  rounds: 1. Achieved 36.38 tok/s. Accuracy 14/14. Both endpoints stream.
+  Static per-layer KV cache (batch=1). No `torch.cat` against the cache.
 
-- **M2. Static KV cache, fp16/bf16, no per-token allocs** — `todo` — rounds: 0.
-  *Why*: a naive decode loop reallocates KV each step (huge mem-BW waste); a
-  preallocated KV cache + in-place writes is the precondition for both
-  FlashAttention/FlashInfer decode and CUDA graphs. Usually rolled into the
-  baseline if the baseline is written carefully — keep this as an explicit
-  Major in case round-1 ships with `torch.cat`.
+- **M2. Static KV cache, fp16/bf16, no per-token allocs** — `done` —
+  rolled into M1. KV cache is preallocated `(1, num_kv_heads, 4096,
+  head_dim)` per layer with in-place slice writes — confirmed by judge.
+  One nit remaining: `_rotate_half` still uses `torch.cat` (37k calls/window
+  per profile) — track as Minor m1.
 
-- **M3. Replace manual attention with FlashAttention / FlashInfer** —
-  `todo` — rounds: 0. *Why*: hand-rolled SDPA in fp16 with separate softmax
-  and matmul kernels wastes ~30-50% of decode time vs. fused attention.
-  FlashInfer's batched-decode path is purpose-built for GQA + paged/static KV
-  with low launch overhead.
+- **M3. Continuous batching across in-flight requests** — `in_progress`
+  (round 2) — rounds: 0. *Why*: TTFT P99 22.35s and 9 idle-gap windows of
+  10-11 ms between requests confirm the server is fully request-serialized
+  by the `asyncio.Lock`. The benchmark drives Poisson arrivals; until
+  decode steps coalesce across in-flight requests, aggregate tok/s cannot
+  exceed single-stream tok/s. Expected: 4-10× aggregate tok/s at modest
+  concurrency. This was previously labelled M4; promoted to M3 because it
+  is the *first* floor item.
 
-- **M4. Continuous batching across in-flight requests** — `todo` — rounds: 0.
-  *Why*: benchmark drives Poisson arrivals; with naive per-request decode the
-  server is idle for most of the wall-clock. A continuous-batching scheduler
-  (admit new requests into the decode batch each step) is the single biggest
-  multi-request win.
+- **M4. Replace manual attention with FlashAttention / FlashInfer** —
+  `todo` — rounds: 0. *Why*: SDPA[MATH] for accuracy parity wastes ~30-50%
+  of decode time vs fused attention. With continuous batching landed in
+  M3, we have variable per-row cache lengths — FlashAttention's
+  `flash_attn_with_kvcache` (or FlashInfer's batched decode) is the right
+  primitive. (This was M3; renumbered.)
 
-- **M5. CUDA graphs on the decode path** — `todo` — rounds: 0. *Why*: at
-  batch=N decode each step launches ~150+ kernels; on H200 launch overhead
-  dominates per-token latency at small batch. Capturing the decode step into a
-  CUDA graph (one per bucketed batch size) eliminates launch overhead and
-  typically gives 20-40% on top of FlashAttention.
+- **M5. CUDA graphs on the decode path** — `todo` — rounds: 0. *Why*:
+  profile is unambiguous: 82% of decode wall is launch-gap. After M3+M4
+  the bucketed decode-step is the natural unit to capture. Expected
+  2-3× on top of M3+M4.
 
-- **M6. Speculative decoding (EAGLE3 or draft model)** — `todo` — rounds: 0.
-  *Why*: at low Poisson rate the workload is essentially single-batch, where
-  arithmetic intensity is fundamentally memory-bound. Speculative decoding
-  trades verifier compute for fewer decode steps — the canonical win in this
-  regime. Defer until M1-M5 are profiler-verified.
+- **M6. Speculative decoding (EAGLE3 or draft model)** — `todo` —
+  rounds: 0. *Why*: at low Poisson rate the workload is essentially
+  single-batch; spec decode trades verifier compute for fewer decode
+  steps. Defer until M3-M5 land.
 
 ## Minor
 
-(none yet — track here as they appear)
+- **m1. Replace `_rotate_half`'s `torch.cat` with an alloc-free rotation**
+  — `todo`. Profile shows 36,928 `CatArrayBatchedCopy` launches per 25s
+  window. Cheap fix, do it inside whichever Major touches RoPE next.
 
 ## Done
 
-(none yet)
+- M1 (baseline server, round 1).
+- M2 (static KV cache, round 1).
 
 ## Parked
 
