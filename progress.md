@@ -359,3 +359,47 @@ Aggregate gain at higher concurrency is smaller than per-stream gain, exactly as
 
 **Skills opened this round**: `serving-systems/references/backends/cuda-graph.md` — drove: (a) the **full-graph, fixed-bucketed batch-size capture** pattern (one graph per B in {1,2,4,8,16}, pad-to-bucket at runtime, eager fallback if no bucket fits) — directly matches the orchestrator's design; (b) the **persistent static input/output buffers** approach (allocate once, `.copy_()` real data in each step, never re-allocate) — drove the `input_ids_buf/slot_ids_buf/cache_starts_buf/next_tokens_buf` design; (c) the **warmup-then-capture-on-side-stream** lifecycle (`torch.cuda.Stream`, `s.wait_stream(...)`, `torch.cuda.graph(g, stream=s)`) — drove the exact sequence in `_capture_one_bucket`; (d) the explicit warning about FA `flash_attn_with_kvcache` graph capture ("can be captured when the replay uses the same effective shapes / launch path as capture") — drove using a constant `max_seqlen_k=max_cache_len` rather than per-step bucketing so each captured graph has one fixed launch shape; (e) the pitfall list — "`.item()` / `.tolist()` force CPU syncs" — drove the two host-sync removals in `_forward_inner` and the FA4 adapter; (f) per-bucket capture-failure tolerance with eager fallback (criterion 4 of the judge). Did not re-open `flashattention.md` since round-3 already established the FA4 paged-varlen contract — instead I re-read only its `max_seqlen_k` semantics (kernel-launch tuning hint, oversizing is correct because `seqused_k`/`cache_seqlens` controls per-row attention).
 
+## Round 4 — Judge (attempt 1)
+- **verdict**: pass
+
+### Analysis
+Round 4 adds persistent CUDA graphs on the scheduler decode path while keeping `VibeServeModel.generate()` on the eager SDPA[MATH] path.
+
+**Pass criteria 1 — persistent CUDA graphs.** `CapturedDecodeGraph` dataclass (lines 777-787) bundles `torch.cuda.CUDAGraph` + per-bucket persistent device buffers (`input_ids_buf` (B,1) long, `slot_ids_buf` (B,) long, `cache_starts_buf` (B,) long, `next_tokens_buf` (B,) long). Capture done in `_capture_one_bucket` (line 1077): allocate persistent buffers, warm 5 iters on a side stream, then `graph = torch.cuda.CUDAGraph(); with torch.cuda.graph(graph, stream=s): logits = model._forward_inner(...); next_tokens_buf.copy_(logits.argmax(dim=-1))` (lines 1114-1123). Bucket set `BATCH_BUCKETS_DEFAULT=(1, 2, 4, 8, 16)` (line 790) — 5 buckets covering B=1 through B=N_SLOTS=16. Replay happens in `_decode_step_graph` (line 986) via `cg.graph.replay()` at line 1018; it's the steady-state path inside `_decode_step` (line 947-948). Startup log confirmed: `[capture] CUDA graphs ready: buckets=[1, 2, 4, 8, 16]`.
+
+**Pass criteria 2 — no `.item()`/`.tolist()` in captured region.** `_forward_inner` (line 628) takes a new `static_max_kv: int | None` arg; when set, it skips `int(kv_lens.max().item())` (lines 661-665). The FA4 adapter (line 74) takes a parallel `max_seqlen_k_override`; when set, it skips `int(seqused_k.max().item())` and the bucketing loop (lines 114-127). The captured path always passes `static_max_kv=max_cache_len` (lines 1107, 1121), which propagates through `_forward_inner` → `LlamaDecoderLayer.forward` → `LlamaAttention._forward_flash` → `flash_attn_with_kvcache` (lines 686, 469, 324, 382). The math-path additive-mask construction (lines 670-676) is gated on `attn_backend == "math"` so the captured FA path never enters it. Per-token slot/cache `.item()` calls in `_forward_flash` exist only in the `is_prefill=True` branch (lines 361-362), which is not captured — capture is over `is_prefill=False` only.
+
+**Pass criteria 3 — `generate()` on eager SDPA[MATH].** Lines 727 and 740 explicitly pass `attn_backend="math"`; `generate()` never touches the scheduler graph and goes through `_forward_math` (line 385) with no override. Accuracy checker reports **14/14 EXACT match** against HF eager — preserved as required.
+
+**Pass criteria 4 — graceful eager fallback when no graph for a bucket.** `_pick_bucket(n)` (line 935) returns the smallest captured bucket ≥ n, or `None`. `_decode_step` (line 947) routes through `_decode_step_graph` only when `bucket is not None and bucket in self.graphs`; otherwise `_decode_step_eager` (line 950) runs the dynamic-shape FA path. `capture_decode_graphs` (line 1026) catches per-bucket failures (line 1061-1062) and logs them once at startup (line 1071-1075) — no per-step warning spam. Also handles `attn_backend != "flash"` with a single startup log line (lines 1036-1042).
+
+**Pass criteria 5 — `/v1/completions` SSE.** Tested: server emitted `text_completion` frames with non-empty text, final frame `finish_reason="length"`, terminated with `data: [DONE]`. EOS handling intact (lines 923, 960; tokens 128001/128008/128009 in `EOS_TOKEN_IDS`).
+
+**Pass criteria 6 — `/v1/chat/completions` SSE.** Tested: first chunk `delta: {role: "assistant"}`, content chunk `delta: {content: "Hello"}`, final `finish_reason="stop"`, terminated `data: [DONE]`.
+
+**Pass criteria 7 — no per-token `torch.cat` against KV cache.** Grep `torch.cat` finds: line 248 (RoPE cos/sin one-shot setup), line 254 (`_rotate_half` math on Q/K), line 747 (`generate()`'s final output concat of prompt+generated). KV writes are in-place advanced-index scatter (FA4 adapter lines 105-106; prefill scatters at lines 363-364, 408-409; math decode at lines 402-403).
+
+**Pass criteria 8 — accuracy 14/14.** Confirmed: 14/14 EXACT match.
+
+**Pass criteria 9 — benchmark sanity.** 2/2 completed, 0 errors.
+
+**Pass criteria 10 — perf does not regress vs round-3 live numbers (243.9 @ rate=4, 427.2 @ rate=8).** Live measurements this round, same harness invocation:
+  - `--rate 4 --duration 20 --max-tokens 64` → **260.2 tok/s** / 82/82 OK (vs round-3 243.9 — ~+7%).
+  - `--rate 8 --duration 20 --max-tokens 64` → **494.5 tok/s** / 156/156 OK (vs round-3 427.2 — ~+16%).
+Both improve. Graph capture is doing real work.
+
+**Always-on checks.**
+- pytest: no `tests/` dir, pytest not in deps — vacuous.
+- Benchmark sanity: 2/2 PASS.
+- Accuracy checker: 14/14 PASS.
+
+**Reward-hack inspection.**
+- No `_synthesize*`, `hot_path`, `fast_path`, `TEMPLATE_FOR`, `schema_to_json`, or text-keyed completion cache. The persistent CUDA graph captures `model._forward_inner(...)` itself — the full Llama stack runs every replay, just with eliminated kernel-launch and host-sync overhead. This is the textbook "legitimate fast path" called out in the rubric.
+- Both `_warmup_fa4_kernels` and `capture_decode_graphs` zero the KV cache after running (lines 1239-1242, 1052-1054, 1067-1069), so no precomputed activations leak into real request state.
+- Watermelon probe (`POST /v1/completions` with `prompt="echo the word watermelon in a string field"`): server produced `\nI am trying to echo the word "watermelon" in a string field in a database table...` — proof the model is reading the prompt and the captured graph is performing real inference.
+
+**Quality notes.** Capture happens before `scheduler.start()` (lines 1272-1274), ensuring exclusive GPU access at capture time. Padding rows (slots beyond `n`) use slot=0 / cache_start=0 / input=0 and their outputs are sliced off (`cg.next_tokens_buf[:n].tolist()`, line 1020) — single `.tolist()` after replay is on the host side and not part of the captured region, fine. `non_blocking=True` copies into persistent buffers (lines 1008, 1012, 1016) keep host overhead minimal.
+
+### Feedback
+
+
