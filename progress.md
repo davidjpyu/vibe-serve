@@ -231,3 +231,37 @@ Expected impact: per-decode-step attention drops from ~3 ms (SDPA[MATH] full sof
 ### Summary
 Implementer produced no structured response.
 
+## Round 3 — Judge (attempt 1)
+- **verdict**: pass
+
+### Analysis
+Round 3 adds FlashAttention on the scheduler decode/prefill path while keeping SDPA[MATH] on `VibeServeModel.generate()` for accuracy parity.
+
+**Runtime environment.** `flash_attn` is installed but the FA2 `flash_attn_with_kvcache` symbol is NOT exported in this build — only the FA4 CuTeDSL surface (`flash_attn.cute.flash_attn_func` + `flash_attn_varlen_func`) is available. The implementer's try/except (lines 61-156) handles this: the FA2 import (line 62) fails, the fallback imports the FA4 CuTeDSL kernels (lines 71-72), and defines locally a `flash_attn_with_kvcache(...)` adapter (lines 74-131) that scatters new K/V into the paged cache and calls `_fa4_varlen(...)` with `page_table=cache_batch_idx[:, None]`. Per the framework's "runtime-environment notes are authoritative" rule, this satisfies criterion 1 in spirit — the implementer wired flash_attn (FA4 variant) in and exposed the `flash_attn_with_kvcache` / `flash_attn_func` symbol names that the rest of the code calls. Startup log confirms `attn_backend=flash, fa_variant=fa4`.
+
+**Pass criteria 1, 2 — FA imports + scheduler decode calls flash_attn_with_kvcache.** Imports at lines 62-66 (FA2 attempt) and 71-72 (FA4 fallback). The scheduler's `_decode_step` (line 880) → `model._forward_inner(..., attn_backend=self.attn_backend)` with `self.attn_backend = "flash"` (line 761) → `LlamaAttention.forward` (line 297) → `_forward_flash` (line 325) → `flash_attn_with_kvcache(...)` at line 358 every decode step. Verified runtime-side at rate=8 by the FA4 path doing actual work (see perf below).
+
+**Pass criteria 3 — SDPA only on generate().** `_forward_math` (lines 370-412) wraps SDPA in `sdpa_kernel([SDPBackend.MATH])`. `generate()` passes `attn_backend="math"` at both lines 696 (prefill) and 709 (decode) — fixed. Scheduler picks `"flash"` at startup (line 761) and never re-evaluates per-step; no runtime fallback. The SDPA branch in `_forward_math` is unreachable from the serving path when FA is available (startup log confirmed). The FA-fallback case is a one-line startup warning (line 152-156), as the criterion allows.
+
+**Pass criteria 4 — KV cache shape.** Buffers `_k_cache_{i}` / `_v_cache_{i}` have shape `(num_slots=16, max_cache_len=4096, num_kv_heads, head_dim)` (lines 512-524) — the NHD/paged layout the criterion explicitly accepts. Single physical tensor per layer across decode steps (registered as non-persistent buffer; advanced-index in-place writes only).
+
+**Pass criteria 5 — no torch.cat vs KV cache.** Grep hits: lines 10 / 340 / 385 are docstring/comment; line 237 is the one-shot RoPE cos/sin build; line 243 is `_rotate_half` math on Q/K; line 716 is `generate()`'s final output concatenation of prompt + generated. KV writes are advanced-index in-place: line 99-100 (FA4 decode adapter), line 349-350 (FA prefill scatter), line 387-388 (SDPA decode), line 393-394 (SDPA prefill slice). No per-token KV growth via cat.
+
+**Pass criteria 6 — accuracy 14/14.** Ran `acc_checker/checker.py` against the local Llama-3.1-8B-Instruct snapshot. Result: **14/14 EXACT token-level matches** vs HF `AutoModelForCausalLM` with `attn_implementation="eager"`. `generate()` stays on SDPA[MATH] as the criterion requires.
+
+**Pass criteria 7, 8 — SSE endpoints.** `/v1/completions` stream=true: emits `text_completion` frames with non-empty `choices[0].text`, final frame `finish_reason="length"`, then `data: [DONE]`. `/v1/chat/completions` stream=true: first chunk `delta: {role: "assistant"}`, content chunks `delta: {content: "Hello"}`, final `finish_reason="stop"`, then `data: [DONE]`. EOS handling: `EOS_TOKEN_IDS=(128001, 128008, 128009)` checked in scheduler `_prefill` (line 870) and `_decode_step` (line 908); EOS tokens cause `finish_reason="stop"` and are not pushed to the token queue.
+
+**Pass criteria 9 — benchmark sanity.** `python bench/benchmark.py --url http://localhost:8000 --num-requests 2 --max-tokens 32`: 2/2 completed, 0 errors.
+
+**Pass criteria 10 — perf vs round-2 baseline 243.4 tok/s.** At the same `--rate 4 --duration 20 --max-tokens 64` shape as round-2, the FA build reports **243.9 tok/s** — slightly above baseline, no regression. At higher concurrency `--rate 8 --duration 20 --max-tokens 64`, **427.2 tok/s / 156/156 OK** — the FA path scales and clearly dominates SDPA[MATH] under load, evidence that FA is actually being executed (a no-op or broken FA path would not scale this way).
+
+**Reward-hack inspection.**
+- No `_synthesize*`, `hot_path`, `fast_path`, `TEMPLATE_FOR`, or `schema_to_json` patterns in main.py. The only "warmup" code (`_warmup_fa4_kernels`, lines 969-1031) is a legitimate JIT pre-compilation pass that runs synthetic forwards through the model with `cache_starts` cycling through power-of-two buckets, then **zeros all KV buffers** (lines 1023-1025) before serving — so no precomputed completion text leaks into the steady-state cache.
+- Novel-prompt probe `POST /v1/completions` with `prompt="echo the word watermelon in a string field"`: server generated `\nI am trying to echo the word "watermelon" in a string field in a database table...` — the model clearly read the prompt and echoed the sentinel via genuine inference.
+- The 14/14 token-level match with HF eager on the accuracy suite is conclusive proof that the model is doing real forward passes.
+
+**Quality notes.** The FA4 adapter buckets `max_seqlen_k` to powers of two (lines 111-116) so FA4's static-shape kernel cache can hit — this is a clean optimization, not a bypass, and the model is still consulted on every decode position. The same-rate (rate=4) tok/s improvement is essentially within noise; FA's win is on higher-concurrency, longer-KV decode steps, which the rate=8 run confirms.
+
+### Feedback
+
+
