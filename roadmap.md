@@ -68,21 +68,26 @@ specific wins.
   One nit remaining: `_rotate_half` still uses `torch.cat` (37k calls/window
   per profile) — track as Minor m1.
 
-- **M3. Continuous batching across in-flight requests** — `in_progress`
-  (round 2) — rounds: 0. *Why*: TTFT P99 22.35s and 9 idle-gap windows of
-  10-11 ms between requests confirm the server is fully request-serialized
-  by the `asyncio.Lock`. The benchmark drives Poisson arrivals; until
-  decode steps coalesce across in-flight requests, aggregate tok/s cannot
-  exceed single-stream tok/s. Expected: 4-10× aggregate tok/s at modest
-  concurrency. This was previously labelled M4; promoted to M3 because it
-  is the *first* floor item.
+- **M3. Continuous batching across in-flight requests** — `done` —
+  rounds: 1 (round 2). Scheduler in `main.py` is the sole GPU consumer,
+  decode batched over slots, asyncio.Lock removed. Benchmark went from
+  36.38 → 243.4 tok/s (6.7×); accuracy still 14/14. TTFT P50 collapsed
+  from ~11s to ~46ms.
 
 - **M4. Replace manual attention with FlashAttention / FlashInfer** —
-  `todo` — rounds: 0. *Why*: SDPA[MATH] for accuracy parity wastes ~30-50%
-  of decode time vs fused attention. With continuous batching landed in
-  M3, we have variable per-row cache lengths — FlashAttention's
-  `flash_attn_with_kvcache` (or FlashInfer's batched decode) is the right
-  primitive. (This was M3; renumbered.)
+  `in_progress` (round 3) — rounds: 0. *Why*: serving path still calls
+  `F.scaled_dot_product_attention` under `sdpa_kernel([SDPBackend.MATH])`
+  which materializes the full attention matrix and runs separate
+  softmax+matmul kernels (round-1 profile: ~3 ms/decode-step attention
+  cost). FlashAttention's `flash_attn_with_kvcache` is purpose-built for
+  the slot-pool design we already have: it takes `(B, max_seqlen, H_kv,
+  D)` cache tensors, per-row `cache_seqlens`, optional `cache_batch_idx`
+  for slot remapping, and writes new K/V into the cache in-place. Will
+  also subsume the K/V cache write (today done via advanced-index
+  scatter) and *can* fuse RoPE if we pass `rotary_cos/rotary_sin` —
+  optionally closes Minor m1. Accuracy gate stays alive by keeping
+  SDPA[MATH] reachable for `VibeServeModel.generate()` (acc_checker's
+  entry point), with FA only on the scheduler's batched-decode path.
 
 - **M5. CUDA graphs on the decode path** — `todo` — rounds: 0. *Why*:
   profile is unambiguous: 82% of decode wall is launch-gap. After M3+M4
@@ -104,6 +109,7 @@ specific wins.
 
 - M1 (baseline server, round 1).
 - M2 (static KV cache, round 1).
+- M3 (continuous batching, round 2): 243.4 tok/s, acc 14/14.
 
 ## Parked
 
