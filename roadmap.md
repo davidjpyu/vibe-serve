@@ -37,21 +37,27 @@ Only after these three are in place do we move to workload-specific optimization
 
 ## Major
 
-- **M1: Accurate baseline server (R1 active)** — `in_progress`, round 1.
-  Build `main.py` exporting `VibeServeModel.from_pretrained(model_dir, device, dtype)` and
-  `.generate(input_ids, max_new_tokens=N)`; wire FastAPI `POST /v1/completions` with
-  streaming SSE per `serving-systems/references/tooling/openai-api.md`. Hand-implement the
-  forward path: RMSNorm, partial+mrope RoPE, gated GQA full-attention, GDN linear-attention,
-  SwiGLU MLP, LM head. Use `fla` (flash-linear-attention) for the GDN recurrence kernel if
-  available, else chunked Python recurrence as a correctness fallback. Goal: accuracy checker
-  passes token-for-token vs HF reference at fp16 greedy.
-  Why: unlocks the loop — every later round depends on a correct forward path.
+- **M1: Accurate baseline server** — `done` (R1).
+  `main.py` exports `VibeServeModel` with hand-written full-attention (GQA 16:4, head_dim=256,
+  partial RoPE 64/256, sigmoid output-gate) and GDN linear-attention (FLA kernels:
+  `chunk_gated_delta_rule` prefill, `fused_recurrent_gated_delta_rule` decode). Caches are
+  pre-allocated (`FullAttnCache` writes K/V in-place via `.copy_`; `GDNCache` holds fp32
+  recurrent state + fp16 conv state). FastAPI `POST /v1/completions` returns SSE. 14/14
+  EXACT token matches vs HF reference fp16 greedy. Bench sanity: 2/2 reqs, 0 errors.
+  Carry-over caveats for R2: SSE is **emulated** (single text frame after full generation
+  → broken TTFT/per-token streaming), and the server is **single-batch** behind an
+  asyncio.Lock (~0.9 tok/s observed) — both addressed by M2.
 
-- **M2: Continuous batching for decode** — `todo`, planned R2-R3.
-  Batch in-flight requests on the decode loop with per-request KV cache slots (full-attn) and
-  per-request GDN state slots (`(state, conv_state)`). The benchmark sends Poisson arrivals,
-  so wall-clock throughput is gated by how many sequences we can decode per step.
-  Why: workload is multi-request; single-batch decode caps throughput at ~ 1/(decode time).
+- **M2: Continuous batching + per-token SSE streaming** — `in_progress`, R2.
+  Decode many requests in lockstep on the GPU, one token per step, instead of one-request-at-a-time
+  under a lock. Per-request KV slots for the 8 full-attn layers and per-request (recurrent_state,
+  conv_state) slots for the 24 GDN layers. Single async step-engine task pulls newly arrived
+  requests, prefills them (one at a time or in a batched prefill), assigns them to free slots,
+  then runs a batched decode step that advances every active sequence by one token. Per-step
+  outputs feed per-request asyncio.Queues so SSE writers emit one token immediately as it is
+  produced. Headline metric: aggregate output tok/s on the Poisson workload.
+  Why: this is the floor item that matters most here — the benchmark is multi-request Poisson,
+  and round 1 caps at 1/(per-request generate time) because of the lock + emulated streaming.
 
 - **M3: Attention kernel — FlashAttention/FlashInfer on full-attention layers** — `todo`, R3.
   Replace eager attention with FA2 / FlashInfer batched-decode (8 full-attn layers, GQA 16:4,
@@ -78,7 +84,7 @@ Only after these three are in place do we move to workload-specific optimization
 
 ## Done
 
-(none yet)
+- **M1** — Accurate baseline server. R1 commit `round-1-retry-1-judge`. 14/14 accuracy.
 
 ## Parked
 

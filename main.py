@@ -4,8 +4,15 @@ Accuracy-checker contract:
     model = VibeServeModel.from_pretrained(model_dir, device, dtype)
     output_ids = model.generate(input_ids, max_new_tokens=N)  # greedy, returns (1, T+N)
 
-FastAPI server:
-    POST /v1/completions  (OpenAI-compatible, SSE on stream=true)
+FastAPI server with continuous batching:
+    POST /v1/completions  (OpenAI-compatible, per-token SSE on stream=true)
+
+Engine design (R2):
+- One async ``StepEngine`` task owns the GPU. Per-layer KV / GDN-state pools sized
+  ``(MAX_BATCH, ...)`` are pre-allocated at startup; active sequences occupy the
+  contiguous prefix ``[0, B)``. On finish, the last active slot is swap-popped into
+  the freed position. Each decode step advances ALL active slots one token at a
+  time, then yields to the event loop so SSE handlers can flush per-token frames.
 """
 
 from __future__ import annotations
@@ -16,6 +23,9 @@ import json
 import os
 import time
 import uuid
+from collections import deque
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -53,23 +63,20 @@ class Qwen35RMSNorm(nn.Module):
 
 
 class Qwen35RotaryEmb(nn.Module):
-    """Partial RoPE. For text-only inputs the three mrope axes share the same
-    position values, so the interleaving in HF collapses to standard RoPE on the
-    first `int(head_dim * partial_rotary_factor)` dimensions of each head."""
+    """Partial RoPE. For text-only inputs the three mrope axes share text positions,
+    so the interleaving in HF collapses to standard RoPE on the first
+    ``int(head_dim * partial_rotary_factor)`` dims of each head."""
 
-    def __init__(self, head_dim: int, partial_rotary_factor: float, rope_theta: float,
-                 mrope_section: list[int]):
+    def __init__(self, head_dim: int, partial_rotary_factor: float, rope_theta: float):
         super().__init__()
         self.rotary_dim = int(head_dim * partial_rotary_factor)
-        self.head_dim = head_dim
-        self.mrope_section = mrope_section
         inv_freq = 1.0 / (rope_theta ** (
             torch.arange(0, self.rotary_dim, 2, dtype=torch.float64) / self.rotary_dim
         ))
         self.register_buffer("inv_freq", inv_freq.float(), persistent=False)
 
     def cos_sin(self, position_ids: torch.Tensor, dtype: torch.dtype):
-        """position_ids: (B, T) long. Returns cos, sin each (B, T, rotary_dim)."""
+        """position_ids: (B, T) long -> cos, sin each (B, T, rotary_dim)."""
         freqs = position_ids.float().unsqueeze(-1) * self.inv_freq.unsqueeze(0).unsqueeze(0)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos().to(dtype), emb.sin().to(dtype)
@@ -105,19 +112,16 @@ class Qwen35MLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Full attention (GQA, head_dim=256, output-gated, partial RoPE)
+# Full attention (GQA, head_dim=256, output-gated, partial RoPE).
 # ---------------------------------------------------------------------------
 
 
 class FullAttnCache:
-    """Pre-allocated KV cache for one layer."""
+    """Per-request KV cache used by the R1 ``.generate()`` path (batch=1)."""
 
     def __init__(self, max_len: int, num_kv_heads: int, head_dim: int, device, dtype):
         self.k = torch.empty(1, num_kv_heads, max_len, head_dim, device=device, dtype=dtype)
         self.v = torch.empty(1, num_kv_heads, max_len, head_dim, device=device, dtype=dtype)
-        self.length = 0
-
-    def reset(self) -> None:
         self.length = 0
 
     def append(self, new_k: torch.Tensor, new_v: torch.Tensor):
@@ -147,55 +151,117 @@ class Qwen35FullAttention(nn.Module):
         self.q_norm = Qwen35RMSNorm(head_dim, eps=rms_eps)
         self.k_norm = Qwen35RMSNorm(head_dim, eps=rms_eps)
 
+    # ---- R1 single-batch path (used by .generate() / accuracy checker) ----
+
     def forward(self, hidden: torch.Tensor, position_ids: torch.Tensor,
                 cache: FullAttnCache | None) -> torch.Tensor:
         B, T, _ = hidden.shape
         qg = self.q_proj(hidden).view(B, T, self.num_heads, self.head_dim * 2)
         q, gate = torch.chunk(qg, 2, dim=-1)
         gate = gate.reshape(B, T, self.num_heads * self.head_dim)
-
         q = self.q_norm(q)
         k = self.k_norm(self.k_proj(hidden).view(B, T, self.num_kv_heads, self.head_dim))
         v = self.v_proj(hidden).view(B, T, self.num_kv_heads, self.head_dim)
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
+        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
         cos, sin = self.rotary.cos_sin(position_ids, q.dtype)
         q, k = apply_partial_rope(q, k, cos, sin)
-
         if cache is not None:
             full_k, full_v = cache.append(k, v)
         else:
             full_k, full_v = k, v
-
         full_k = full_k.repeat_interleave(self.num_kv_groups, dim=1)
         full_v = full_v.repeat_interleave(self.num_kv_groups, dim=1)
-
-        S_q = q.shape[2]
-        S_k = full_k.shape[2]
+        S_q, S_k = q.shape[2], full_k.shape[2]
         scores = torch.matmul(q, full_k.transpose(-2, -1)) * self.scaling
         if S_q > 1:
             i = torch.arange(S_q, device=scores.device).unsqueeze(-1)
             j = torch.arange(S_k, device=scores.device).unsqueeze(0)
-            mask = j > (S_k - S_q + i)
-            scores = scores.masked_fill(mask, float("-inf"))
+            scores = scores.masked_fill(j > (S_k - S_q + i), float("-inf"))
         attn = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        out = torch.matmul(attn, full_v)
-        out = out.transpose(1, 2).contiguous().reshape(B, T, self.num_heads * self.head_dim)
+        out = torch.matmul(attn, full_v).transpose(1, 2).contiguous().reshape(B, T, -1)
+        out = out * torch.sigmoid(gate)
+        return self.o_proj(out)
 
+    # ---- R2 pooled paths (used by the StepEngine) ----
+
+    def prefill_pool(self, hidden: torch.Tensor, position_ids: torch.Tensor,
+                     K_pool: torch.Tensor, V_pool: torch.Tensor, slot: int) -> torch.Tensor:
+        """Single-request prefill into slot ``slot`` of the per-layer K/V pool.
+        K_pool/V_pool: (MAX_BATCH, num_kv_heads, MAX_LEN, head_dim).
+        """
+        B, T, _ = hidden.shape  # B == 1
+        qg = self.q_proj(hidden).view(B, T, self.num_heads, self.head_dim * 2)
+        q, gate = torch.chunk(qg, 2, dim=-1)
+        gate = gate.reshape(B, T, self.num_heads * self.head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(self.k_proj(hidden).view(B, T, self.num_kv_heads, self.head_dim))
+        v = self.v_proj(hidden).view(B, T, self.num_kv_heads, self.head_dim)
+        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
+        cos, sin = self.rotary.cos_sin(position_ids, q.dtype)
+        q, k = apply_partial_rope(q, k, cos, sin)
+
+        # Write prompt K/V into the pool slot's prefix [0, T).
+        K_pool[slot, :, :T, :].copy_(k[0])
+        V_pool[slot, :, :T, :].copy_(v[0])
+
+        full_k = k.repeat_interleave(self.num_kv_groups, dim=1)
+        full_v = v.repeat_interleave(self.num_kv_groups, dim=1)
+        scores = torch.matmul(q, full_k.transpose(-2, -1)) * self.scaling
+        i = torch.arange(T, device=scores.device).unsqueeze(-1)
+        j = torch.arange(T, device=scores.device).unsqueeze(0)
+        scores = scores.masked_fill(j > i, float("-inf"))
+        attn = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+        out = torch.matmul(attn, full_v).transpose(1, 2).contiguous().reshape(B, T, -1)
+        out = out * torch.sigmoid(gate)
+        return self.o_proj(out)
+
+    def decode_pool(self, hidden: torch.Tensor, K_pool: torch.Tensor, V_pool: torch.Tensor,
+                    lengths_after: torch.Tensor, max_kv_len: int, B: int) -> torch.Tensor:
+        """Batched single-token decode over the contiguous active prefix ``[0, B)``.
+        ``lengths_after``: LongTensor[B] of K/V length *after* writing this step's new K/V
+        (so the new token sits at index ``lengths_after - 1``).
+        """
+        qg = self.q_proj(hidden).view(B, 1, self.num_heads, self.head_dim * 2)
+        q, gate = torch.chunk(qg, 2, dim=-1)
+        gate = gate.reshape(B, 1, self.num_heads * self.head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(self.k_proj(hidden).view(B, 1, self.num_kv_heads, self.head_dim))
+        v = self.v_proj(hidden).view(B, 1, self.num_kv_heads, self.head_dim)
+        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
+
+        # Per-row position is lengths_after - 1 (0-indexed).
+        positions = (lengths_after - 1).unsqueeze(1)  # (B, 1)
+        cos, sin = self.rotary.cos_sin(positions, q.dtype)
+        q, k = apply_partial_rope(q, k, cos, sin)
+
+        # Scatter new K/V into pool at row i, position lengths_after[i]-1, in place.
+        batch_idx = torch.arange(B, device=K_pool.device)
+        write_pos = lengths_after - 1
+        K_pool[batch_idx, :, write_pos, :] = k[:, :, 0, :]
+        V_pool[batch_idx, :, write_pos, :] = v[:, :, 0, :]
+
+        # Attention over the active prefix's max length, masking padded positions per row.
+        full_k = K_pool[:B, :, :max_kv_len, :]
+        full_v = V_pool[:B, :, :max_kv_len, :]
+        full_k = full_k.repeat_interleave(self.num_kv_groups, dim=1)
+        full_v = full_v.repeat_interleave(self.num_kv_groups, dim=1)
+        scores = torch.matmul(q, full_k.transpose(-2, -1)) * self.scaling  # (B, H, 1, max_kv_len)
+        pos_j = torch.arange(max_kv_len, device=q.device)
+        mask = pos_j[None, None, None, :] >= lengths_after[:, None, None, None]
+        scores = scores.masked_fill(mask, float("-inf"))
+        attn = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+        out = torch.matmul(attn, full_v).transpose(1, 2).contiguous().reshape(B, 1, -1)
         out = out * torch.sigmoid(gate)
         return self.o_proj(out)
 
 
 # ---------------------------------------------------------------------------
-# Linear attention (Gated DeltaNet)
+# Linear attention (Gated DeltaNet) — both per-request and pooled paths.
 # ---------------------------------------------------------------------------
 
 
 class GDNCache:
-    """Pre-allocated GDN recurrence + conv1d cache for one layer."""
+    """Per-request GDN state used by the R1 ``.generate()`` path."""
 
     def __init__(self, num_v_heads: int, head_k_dim: int, head_v_dim: int,
                  conv_dim: int, conv_kernel: int, device, dtype, state_dtype):
@@ -235,9 +301,22 @@ class Qwen35GatedDeltaNet(nn.Module):
         self.norm = FusedRMSNormGated(head_v_dim, eps=rms_eps, activation="swish")
         self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
+    # ---- helpers shared by both paths ----
+
+    def _post_recurrent_proj(self, core_out: torch.Tensor, z: torch.Tensor,
+                              B: int, T: int) -> torch.Tensor:
+        core_flat = core_out.reshape(-1, self.head_v_dim)
+        z_flat = z.reshape(-1, self.head_v_dim)
+        core_flat = self.norm(core_flat, z_flat)
+        return self.out_proj(core_flat.reshape(B, T, self.value_dim))
+
+    def _gate_decay(self, a: torch.Tensor) -> torch.Tensor:
+        """g = -exp(A_log) * softplus(a + dt_bias), computed in fp32."""
+        return -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+
+    # ---- R1 single-batch path ----
+
     def _conv_update_step(self, x: torch.Tensor, conv_state: torch.Tensor) -> torch.Tensor:
-        """Single-token causal conv1d with silu, in-place state update.
-        x: (B, conv_dim, 1). conv_state: (B, conv_dim, kernel-1)."""
         weight = self.conv1d.weight.squeeze(1)
         window = torch.cat([conv_state, x.to(conv_state.dtype)], dim=-1)
         conv_state.copy_(window[:, :, -(self.conv_kernel - 1):])
@@ -247,12 +326,10 @@ class Qwen35GatedDeltaNet(nn.Module):
     def forward(self, hidden: torch.Tensor, cache: GDNCache | None) -> torch.Tensor:
         B, T, _ = hidden.shape
         use_cached = cache is not None and cache.has_state
-
         mixed_qkv = self.in_proj_qkv(hidden).transpose(1, 2)
         z = self.in_proj_z(hidden).reshape(B, T, self.num_v_heads, self.head_v_dim)
         b = self.in_proj_b(hidden)
         a = self.in_proj_a(hidden)
-
         if use_cached and T == 1:
             mixed_qkv = self._conv_update_step(mixed_qkv, cache.conv_state)
         else:
@@ -265,46 +342,104 @@ class Qwen35GatedDeltaNet(nn.Module):
             mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, : mixed_qkv.shape[-1]])
             if use_cached:
                 mixed_qkv = mixed_qkv[:, :, -T:]
-
         mixed_qkv = mixed_qkv.transpose(1, 2)
         q, k, v = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
         q = q.reshape(B, T, self.num_k_heads, self.head_k_dim)
         k = k.reshape(B, T, self.num_k_heads, self.head_k_dim)
         v = v.reshape(B, T, self.num_v_heads, self.head_v_dim)
-
         beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        g = self._gate_decay(a)
+        if self.num_v_heads // self.num_k_heads > 1:
+            rep = self.num_v_heads // self.num_k_heads
+            q = q.repeat_interleave(rep, dim=2)
+            k = k.repeat_interleave(rep, dim=2)
+        init_state = cache.recurrent_state if use_cached else None
+        out_state = cache is not None
+        if use_cached and T == 1:
+            core_out, last_state = fused_recurrent_gated_delta_rule(
+                q, k, v, g=g, beta=beta, initial_state=init_state,
+                output_final_state=out_state, use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            core_out, last_state = chunk_gated_delta_rule(
+                q, k, v, g=g, beta=beta, initial_state=init_state,
+                output_final_state=out_state, use_qk_l2norm_in_kernel=True,
+            )
+        if cache is not None and last_state is not None:
+            cache.recurrent_state.copy_(last_state.to(cache.recurrent_state.dtype))
+            cache.has_state = True
+        return self._post_recurrent_proj(core_out, z, B, T)
 
+    # ---- R2 pooled paths ----
+
+    def prefill_pool(self, hidden: torch.Tensor, state_pool: torch.Tensor,
+                     conv_pool: torch.Tensor, slot: int) -> torch.Tensor:
+        """Single-request prefill that primes pool slot's GDN + conv state."""
+        B, T, _ = hidden.shape  # B == 1
+        mixed_qkv = self.in_proj_qkv(hidden).transpose(1, 2)  # (1, conv_dim, T)
+        z = self.in_proj_z(hidden).reshape(B, T, self.num_v_heads, self.head_v_dim)
+        b = self.in_proj_b(hidden)
+        a = self.in_proj_a(hidden)
+
+        # Save new conv state = last (kernel-1) of the (left-zero-padded if short) input.
+        pad_left = self.conv_kernel - mixed_qkv.shape[-1]
+        padded = F.pad(mixed_qkv, (max(pad_left, 0), 0))
+        conv_pool[slot].copy_(padded[0, :, -(self.conv_kernel - 1):].to(conv_pool.dtype))
+
+        mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :T])
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+        q, k, v = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.reshape(B, T, self.num_k_heads, self.head_k_dim)
+        k = k.reshape(B, T, self.num_k_heads, self.head_k_dim)
+        v = v.reshape(B, T, self.num_v_heads, self.head_v_dim)
+        beta = b.sigmoid()
+        g = self._gate_decay(a)
+        if self.num_v_heads // self.num_k_heads > 1:
+            rep = self.num_v_heads // self.num_k_heads
+            q = q.repeat_interleave(rep, dim=2)
+            k = k.repeat_interleave(rep, dim=2)
+        core_out, final_state = chunk_gated_delta_rule(
+            q, k, v, g=g, beta=beta,
+            initial_state=None, output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        state_pool[slot].copy_(final_state[0].to(state_pool.dtype))
+        return self._post_recurrent_proj(core_out, z, B, T)
+
+    def decode_pool(self, hidden: torch.Tensor, state_pool: torch.Tensor,
+                    conv_pool: torch.Tensor, B: int) -> torch.Tensor:
+        """Batched single-token decode over the contiguous active prefix ``[0, B)``."""
+        mixed_qkv = self.in_proj_qkv(hidden).transpose(1, 2)  # (B, conv_dim, 1)
+        z = self.in_proj_z(hidden).reshape(B, 1, self.num_v_heads, self.head_v_dim)
+        b = self.in_proj_b(hidden)
+        a = self.in_proj_a(hidden)
+
+        # Batched causal-conv1d step on the active prefix, in-place state update.
+        conv_state_slice = conv_pool[:B]
+        window = torch.cat([conv_state_slice, mixed_qkv.to(conv_state_slice.dtype)], dim=-1)
+        conv_state_slice.copy_(window[:, :, -(self.conv_kernel - 1):])
+        weight = self.conv1d.weight.squeeze(1)  # (conv_dim, kernel)
+        out_conv = (window * weight.unsqueeze(0)).sum(dim=-1, keepdim=True)
+        mixed_qkv = F.silu(out_conv).to(mixed_qkv.dtype).transpose(1, 2)  # (B, 1, conv_dim)
+
+        q, k, v = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.reshape(B, 1, self.num_k_heads, self.head_k_dim)
+        k = k.reshape(B, 1, self.num_k_heads, self.head_k_dim)
+        v = v.reshape(B, 1, self.num_v_heads, self.head_v_dim)
+        beta = b.sigmoid()
+        g = self._gate_decay(a)
         if self.num_v_heads // self.num_k_heads > 1:
             rep = self.num_v_heads // self.num_k_heads
             q = q.repeat_interleave(rep, dim=2)
             k = k.repeat_interleave(rep, dim=2)
 
-        init_state = cache.recurrent_state if use_cached else None
-        out_state = cache is not None
-
-        if use_cached and T == 1:
-            core_out, last_state = fused_recurrent_gated_delta_rule(
-                q, k, v, g=g, beta=beta,
-                initial_state=init_state, output_final_state=out_state,
-                use_qk_l2norm_in_kernel=True,
-            )
-        else:
-            core_out, last_state = chunk_gated_delta_rule(
-                q, k, v, g=g, beta=beta,
-                initial_state=init_state, output_final_state=out_state,
-                use_qk_l2norm_in_kernel=True,
-            )
-
-        if cache is not None and last_state is not None:
-            cache.recurrent_state.copy_(last_state.to(cache.recurrent_state.dtype))
-            cache.has_state = True
-
-        core_flat = core_out.reshape(-1, self.head_v_dim)
-        z_flat = z.reshape(-1, self.head_v_dim)
-        core_flat = self.norm(core_flat, z_flat)
-        core_out = core_flat.reshape(B, T, self.value_dim)
-        return self.out_proj(core_out)
+        init_state = state_pool[:B]
+        core_out, final_state = fused_recurrent_gated_delta_rule(
+            q, k, v, g=g, beta=beta, initial_state=init_state,
+            output_final_state=True, use_qk_l2norm_in_kernel=True,
+        )
+        state_pool[:B].copy_(final_state)
+        return self._post_recurrent_proj(core_out, z, B, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +461,8 @@ class Qwen35DecoderLayer(nn.Module):
         else:
             self.linear_attn = linear_attn
 
+    # ---- R1 per-request forward (used by .generate()) ----
+
     def forward(self, hidden: torch.Tensor, position_ids: torch.Tensor,
                 full_cache: FullAttnCache | None, gdn_cache: GDNCache | None) -> torch.Tensor:
         residual = hidden
@@ -339,6 +476,34 @@ class Qwen35DecoderLayer(nn.Module):
         hidden = self.post_attention_layernorm(hidden)
         hidden = self.mlp(hidden)
         return residual + hidden
+
+    # ---- R2 pooled paths ----
+
+    def prefill_pool(self, hidden: torch.Tensor, position_ids: torch.Tensor,
+                     K_pool, V_pool, state_pool, conv_pool, slot: int) -> torch.Tensor:
+        residual = hidden
+        hidden = self.input_layernorm(hidden)
+        if self.layer_type == "full_attention":
+            hidden = self.self_attn.prefill_pool(hidden, position_ids, K_pool, V_pool, slot)
+        else:
+            hidden = self.linear_attn.prefill_pool(hidden, state_pool, conv_pool, slot)
+        hidden = residual + hidden
+        residual = hidden
+        hidden = self.post_attention_layernorm(hidden)
+        return residual + self.mlp(hidden)
+
+    def decode_pool(self, hidden: torch.Tensor, K_pool, V_pool, state_pool, conv_pool,
+                    lengths_after: torch.Tensor, max_kv_len: int, B: int) -> torch.Tensor:
+        residual = hidden
+        hidden = self.input_layernorm(hidden)
+        if self.layer_type == "full_attention":
+            hidden = self.self_attn.decode_pool(hidden, K_pool, V_pool, lengths_after, max_kv_len, B)
+        else:
+            hidden = self.linear_attn.decode_pool(hidden, state_pool, conv_pool, B)
+        hidden = residual + hidden
+        residual = hidden
+        hidden = self.post_attention_layernorm(hidden)
+        return residual + self.mlp(hidden)
 
 
 class VibeServeModel(nn.Module):
@@ -366,13 +531,16 @@ class VibeServeModel(nn.Module):
         self.linear_head_k_dim = config_text.linear_key_head_dim
         self.linear_head_v_dim = config_text.linear_value_head_dim
         self.linear_conv_kernel = config_text.linear_conv_kernel_dim
+        self.linear_conv_dim = (
+            self.linear_num_k_heads * self.linear_head_k_dim * 2
+            + self.linear_num_v_heads * self.linear_head_v_dim
+        )
 
         rope_params = config_text.rope_parameters
         self.rotary = Qwen35RotaryEmb(
             head_dim=self.head_dim,
             partial_rotary_factor=rope_params.get("partial_rotary_factor", 1.0),
             rope_theta=rope_params["rope_theta"],
-            mrope_section=rope_params.get("mrope_section", [11, 11, 10]),
         )
 
         self.embed_tokens = nn.Embedding(self.vocab_size, self.hidden_size)
@@ -397,12 +565,46 @@ class VibeServeModel(nn.Module):
         self.norm = Qwen35RMSNorm(self.hidden_size, eps=self.rms_eps)
         self.lm_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
 
-    def _build_caches(self, max_len: int):
+    # ---- Pool-aware single-step model passes (used by StepEngine) ----
+
+    @torch.inference_mode()
+    def prefill_to_slot(self, input_ids: torch.LongTensor, slot: int, pool: "Pool") -> int:
+        """Run prefill into ``pool`` slot ``slot``. Returns first decoded token id (int)."""
+        T = input_ids.shape[1]
+        pos = torch.arange(T, device=self.device).unsqueeze(0)  # (1, T)
+        hidden = self.embed_tokens(input_ids).to(self.dtype)
+        for i, layer in enumerate(self.layers):
+            hidden = layer.prefill_pool(
+                hidden, pos,
+                pool.full_K[i], pool.full_V[i],
+                pool.gdn_state[i], pool.gdn_conv[i],
+                slot,
+            )
+        hidden = self.norm(hidden)
+        logits = self.lm_head(hidden[:, -1, :])  # (1, V)
+        return int(logits.argmax(dim=-1).item())
+
+    @torch.inference_mode()
+    def decode_batch(self, last_tokens: torch.LongTensor, pool: "Pool",
+                     B: int, lengths_after: torch.Tensor, max_kv_len: int) -> torch.LongTensor:
+        """Batched decode step. ``last_tokens``: (B, 1). Returns next-token ids (B,)."""
+        hidden = self.embed_tokens(last_tokens).to(self.dtype)
+        for i, layer in enumerate(self.layers):
+            hidden = layer.decode_pool(
+                hidden,
+                pool.full_K[i], pool.full_V[i],
+                pool.gdn_state[i], pool.gdn_conv[i],
+                lengths_after, max_kv_len, B,
+            )
+        hidden = self.norm(hidden)
+        logits = self.lm_head(hidden[:, -1, :])  # (B, V)
+        return logits.argmax(dim=-1)
+
+    # ---- R1 batch=1 .generate() retained for the accuracy checker ----
+
+    def _build_caches_b1(self, max_len: int):
         full_caches: list[FullAttnCache | None] = []
         gdn_caches: list[GDNCache | None] = []
-        conv_dim = (self.linear_num_k_heads * self.linear_head_k_dim) * 2 + (
-            self.linear_num_v_heads * self.linear_head_v_dim
-        )
         for lt in self.layer_types:
             if lt == "full_attention":
                 full_caches.append(FullAttnCache(
@@ -415,33 +617,28 @@ class VibeServeModel(nn.Module):
                     num_v_heads=self.linear_num_v_heads,
                     head_k_dim=self.linear_head_k_dim,
                     head_v_dim=self.linear_head_v_dim,
-                    conv_dim=conv_dim,
+                    conv_dim=self.linear_conv_dim,
                     conv_kernel=self.linear_conv_kernel,
-                    device=self.device,
-                    dtype=self.dtype,
-                    state_dtype=torch.float32,
+                    device=self.device, dtype=self.dtype, state_dtype=torch.float32,
                 ))
         return full_caches, gdn_caches
 
-    def _forward_layers(self, hidden: torch.Tensor, position_ids: torch.Tensor,
-                        full_caches, gdn_caches) -> torch.Tensor:
+    def _forward_b1(self, hidden, position_ids, full_caches, gdn_caches) -> torch.Tensor:
         for i, layer in enumerate(self.layers):
             hidden = layer(hidden, position_ids, full_caches[i], gdn_caches[i])
         return self.norm(hidden)
 
     @torch.inference_mode()
     def generate(self, input_ids: torch.LongTensor, max_new_tokens: int = 16) -> torch.LongTensor:
-        assert input_ids.dim() == 2 and input_ids.shape[0] == 1, "Round 1 supports batch=1."
+        assert input_ids.dim() == 2 and input_ids.shape[0] == 1, "Batch=1 only."
         input_ids = input_ids.to(self.device)
         prompt_len = input_ids.shape[1]
         max_len = prompt_len + max_new_tokens
 
-        full_caches, gdn_caches = self._build_caches(max_len)
-
-        # Prefill
+        full_caches, gdn_caches = self._build_caches_b1(max_len)
         position_ids = torch.arange(prompt_len, device=self.device).unsqueeze(0)
         hidden = self.embed_tokens(input_ids).to(self.dtype)
-        hidden = self._forward_layers(hidden, position_ids, full_caches, gdn_caches)
+        hidden = self._forward_b1(hidden, position_ids, full_caches, gdn_caches)
         logits = self.lm_head(hidden[:, -1:, :])
         next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
@@ -449,22 +646,22 @@ class VibeServeModel(nn.Module):
         output[:, :prompt_len] = input_ids
         output[:, prompt_len:prompt_len + 1] = next_tok
         out_len = prompt_len + 1
-
         if next_tok.item() == self.EOS_TOKEN_ID:
             return output[:, :out_len]
 
         for step in range(1, max_new_tokens):
             cur_pos = torch.full((1, 1), prompt_len + step - 1, device=self.device, dtype=torch.long)
             hidden = self.embed_tokens(next_tok).to(self.dtype)
-            hidden = self._forward_layers(hidden, cur_pos, full_caches, gdn_caches)
+            hidden = self._forward_b1(hidden, cur_pos, full_caches, gdn_caches)
             logits = self.lm_head(hidden[:, -1:, :])
             next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             output[:, prompt_len + step:prompt_len + step + 1] = next_tok
             out_len = prompt_len + step + 1
             if next_tok.item() == self.EOS_TOKEN_ID:
                 break
-
         return output[:, :out_len]
+
+    # ---- weight loading ----
 
     @classmethod
     def from_pretrained(cls, model_dir: str, device, dtype) -> "VibeServeModel":
@@ -543,7 +740,226 @@ class VibeServeModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# FastAPI server (OpenAI-compatible /v1/completions, SSE on stream=true)
+# Continuous-batching engine
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Pool:
+    """Pre-allocated per-layer KV / GDN-state pools, sized for ``MAX_BATCH`` slots."""
+
+    full_K: list[torch.Tensor | None]
+    full_V: list[torch.Tensor | None]
+    gdn_state: list[torch.Tensor | None]
+    gdn_conv: list[torch.Tensor | None]
+    lengths: torch.Tensor  # (MAX_BATCH,) on device
+
+    @classmethod
+    def allocate(cls, model: VibeServeModel, max_batch: int, max_len: int) -> "Pool":
+        full_K: list[torch.Tensor | None] = []
+        full_V: list[torch.Tensor | None] = []
+        gdn_state: list[torch.Tensor | None] = []
+        gdn_conv: list[torch.Tensor | None] = []
+        for lt in model.layer_types:
+            if lt == "full_attention":
+                K = torch.empty(max_batch, model.num_kv_heads, max_len, model.head_dim,
+                                device=model.device, dtype=model.dtype)
+                V = torch.empty_like(K)
+                full_K.append(K); full_V.append(V)
+                gdn_state.append(None); gdn_conv.append(None)
+            else:
+                state = torch.zeros(max_batch, model.linear_num_v_heads,
+                                    model.linear_head_k_dim, model.linear_head_v_dim,
+                                    device=model.device, dtype=torch.float32)
+                conv = torch.zeros(max_batch, model.linear_conv_dim,
+                                   model.linear_conv_kernel - 1,
+                                   device=model.device, dtype=model.dtype)
+                gdn_state.append(state); gdn_conv.append(conv)
+                full_K.append(None); full_V.append(None)
+        lengths = torch.zeros(max_batch, dtype=torch.long, device=model.device)
+        return cls(full_K=full_K, full_V=full_V, gdn_state=gdn_state, gdn_conv=gdn_conv,
+                   lengths=lengths)
+
+
+@dataclass
+class EngineRequest:
+    prompt_ids: torch.LongTensor  # (1, T) on device
+    max_tokens: int
+    out_queue: asyncio.Queue
+    done: asyncio.Event
+    last_token: int = 0
+    tokens_emitted: int = 0
+    finish_reason: str | None = None
+
+
+class StepEngine:
+    """Single asyncio.Task that owns the GPU. Admits new requests, runs a batched
+    decode step over all active sequences, and pushes per-token results onto each
+    request's queue."""
+
+    def __init__(self, model: VibeServeModel, max_batch: int = 16, max_len: int = 4096,
+                 step_log_interval: int = 0):
+        self.model = model
+        self.max_batch = max_batch
+        self.max_len = max_len
+        self.device = model.device
+        self.pool = Pool.allocate(model, max_batch, max_len)
+
+        self.waiting: deque[EngineRequest] = deque()
+        self.active: list[EngineRequest] = []  # active[i] occupies pool slot i.
+        self.B = 0
+
+        self.wake = asyncio.Event()
+        self.stop_event = asyncio.Event()
+        self.task: asyncio.Task | None = None
+        self._step_log_interval = step_log_interval
+        self._step_count = 0
+        self._max_observed_B = 0
+
+    # ---- public API ----
+
+    def submit(self, req: EngineRequest) -> None:
+        self.waiting.append(req)
+        self.wake.set()
+
+    def start(self) -> None:
+        self.task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        self.stop_event.set()
+        self.wake.set()
+        if self.task is not None:
+            try:
+                await asyncio.wait_for(self.task, timeout=5.0)
+            except asyncio.TimeoutError:
+                self.task.cancel()
+
+    # ---- internal main loop ----
+
+    async def _run(self) -> None:
+        while not self.stop_event.is_set():
+            if not self.active and not self.waiting:
+                self.wake.clear()
+                if self.stop_event.is_set():
+                    return
+                try:
+                    await asyncio.wait_for(self.wake.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                if self.stop_event.is_set():
+                    return
+
+            # Admit phase: prefill each new request alone, in turn.
+            admitted_any = False
+            while self.B < self.max_batch and self.waiting:
+                req = self.waiting.popleft()
+                self._admit(req)
+                admitted_any = True
+
+            # Decode phase: one batched step over all active.
+            if self.active:
+                self._decode_step()
+
+            if self._step_log_interval > 0:
+                self._step_count += 1
+                self._max_observed_B = max(self._max_observed_B, self.B + len(self.active) - self.B)
+                if self._step_count % self._step_log_interval == 0:
+                    print(f"[engine] step={self._step_count} B={self.B} "
+                          f"waiting={len(self.waiting)} max_observed_B={self._max_observed_B}",
+                          flush=True)
+
+            # Yield to other tasks so SSE handlers can flush queued tokens.
+            await asyncio.sleep(0)
+
+    def _admit(self, req: EngineRequest) -> None:
+        slot = self.B
+        T = req.prompt_ids.shape[1]
+        if T + req.max_tokens > self.max_len:
+            # Clamp generation so we don't blow the slot's max context.
+            req.max_tokens = max(0, self.max_len - T)
+            if req.max_tokens == 0:
+                req.finish_reason = "length"
+                req.out_queue.put_nowait((None, "length"))
+                req.done.set()
+                return
+
+        first_tok = self.model.prefill_to_slot(req.prompt_ids, slot, self.pool)
+        self.pool.lengths[slot] = T
+        self.active.append(req)
+        self.B += 1
+        if self.B > self._max_observed_B:
+            self._max_observed_B = self.B
+
+        req.tokens_emitted = 1
+        req.last_token = first_tok
+        if first_tok == VibeServeModel.EOS_TOKEN_ID:
+            req.finish_reason = "stop"
+            req.out_queue.put_nowait((None, "stop"))
+            req.done.set()
+            self._swap_pop_slot(self.B - 1)
+        elif req.tokens_emitted >= req.max_tokens:
+            req.out_queue.put_nowait((first_tok, None))
+            req.finish_reason = "length"
+            req.out_queue.put_nowait((None, "length"))
+            req.done.set()
+            self._swap_pop_slot(self.B - 1)
+        else:
+            req.out_queue.put_nowait((first_tok, None))
+
+    def _decode_step(self) -> None:
+        B = self.B
+        last_tokens = torch.tensor(
+            [r.last_token for r in self.active], dtype=torch.long, device=self.device,
+        ).unsqueeze(1)  # (B, 1)
+        # After append, each row's K/V length = lengths[slot] + 1.
+        self.pool.lengths[:B] += 1
+        lengths_after = self.pool.lengths[:B]
+        max_kv_len = int(lengths_after.max().item())
+
+        new_tokens = self.model.decode_batch(last_tokens, self.pool, B, lengths_after, max_kv_len)
+        new_tokens_cpu = new_tokens.tolist()
+
+        finished: list[int] = []
+        for i, req in enumerate(self.active):
+            tok = int(new_tokens_cpu[i])
+            req.tokens_emitted += 1
+            req.last_token = tok
+            if tok == VibeServeModel.EOS_TOKEN_ID:
+                req.finish_reason = "stop"
+                req.out_queue.put_nowait((None, "stop"))
+                req.done.set()
+                finished.append(i)
+            elif req.tokens_emitted >= req.max_tokens:
+                req.out_queue.put_nowait((tok, None))
+                req.finish_reason = "length"
+                req.out_queue.put_nowait((None, "length"))
+                req.done.set()
+                finished.append(i)
+            else:
+                req.out_queue.put_nowait((tok, None))
+
+        for i in sorted(finished, reverse=True):
+            self._swap_pop_slot(i)
+
+    def _swap_pop_slot(self, i: int) -> None:
+        last = self.B - 1
+        if i != last:
+            for layer_idx in range(self.model.num_layers):
+                K = self.pool.full_K[layer_idx]
+                if K is not None:
+                    K[i].copy_(K[last])
+                    self.pool.full_V[layer_idx][i].copy_(self.pool.full_V[layer_idx][last])
+                else:
+                    self.pool.gdn_state[layer_idx][i].copy_(self.pool.gdn_state[layer_idx][last])
+                    self.pool.gdn_conv[layer_idx][i].copy_(self.pool.gdn_conv[layer_idx][last])
+            self.pool.lengths[i] = self.pool.lengths[last]
+            self.active[i] = self.active[last]
+        self.active.pop()
+        self.B -= 1
+
+
+# ---------------------------------------------------------------------------
+# FastAPI server with per-token SSE streaming.
 # ---------------------------------------------------------------------------
 
 from fastapi import FastAPI
@@ -569,140 +985,151 @@ class CompletionRequest(BaseModel):
 _state: dict[str, Any] = {}
 
 
-def _make_app() -> FastAPI:
-    app = FastAPI()
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    model_dir = DEFAULT_MODEL_DIR
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16
+    max_batch = int(os.environ.get("VIBE_MAX_BATCH", "16"))
+    max_len = int(os.environ.get("VIBE_MAX_LEN", "4096"))
+    step_log_interval = int(os.environ.get("VIBE_STEP_LOG_INTERVAL", "0"))
 
-    @app.on_event("startup")
-    async def _startup() -> None:
-        model_dir = DEFAULT_MODEL_DIR
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16
-        print(f"[vibeserve] loading model from {model_dir} on {device} ({dtype})")
-        t0 = time.perf_counter()
-        tok = AutoTokenizer.from_pretrained(model_dir)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
-        model = VibeServeModel.from_pretrained(model_dir, device, dtype)
-        print(f"[vibeserve] loaded in {time.perf_counter() - t0:.1f}s")
-        _state["model"] = model
-        _state["tokenizer"] = tok
-        _state["device"] = device
-        _state["lock"] = asyncio.Lock()
-        _state["model_id"] = os.path.basename(model_dir.rstrip("/")) or "qwen3.5-9b"
+    print(f"[vibeserve] loading model from {model_dir} on {device} ({dtype})", flush=True)
+    t0 = time.perf_counter()
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    model = VibeServeModel.from_pretrained(model_dir, device, dtype)
+    print(f"[vibeserve] model loaded in {time.perf_counter() - t0:.1f}s", flush=True)
 
-    @app.get("/health")
-    async def health():
-        return {"status": "ok"}
+    engine = StepEngine(model, max_batch=max_batch, max_len=max_len,
+                        step_log_interval=step_log_interval)
+    engine.start()
+    print(f"[vibeserve] engine started (MAX_BATCH={max_batch}, MAX_LEN={max_len})", flush=True)
 
-    @app.get("/v1/models")
-    async def models():
-        return {
-            "object": "list",
-            "data": [{
-                "id": _state.get("model_id", "qwen3.5-9b"),
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "local",
-            }],
-        }
+    _state["model"] = model
+    _state["tokenizer"] = tok
+    _state["device"] = device
+    _state["engine"] = engine
+    _state["model_id"] = os.path.basename(model_dir.rstrip("/")) or "qwen3.5-9b"
+    try:
+        yield
+    finally:
+        await engine.stop()
 
-    @app.post("/v1/completions")
-    async def completions(req: CompletionRequest):
-        prompt = req.prompt if isinstance(req.prompt, str) else req.prompt[0]
-        stop_seqs: list[str] = []
-        if req.stop is not None:
-            stop_seqs = [req.stop] if isinstance(req.stop, str) else list(req.stop)
 
-        if req.stream:
-            return StreamingResponse(
-                _stream_completion(prompt, req.max_tokens, stop_seqs),
-                media_type="text/event-stream",
-            )
-        text, finish_reason, prompt_tokens, completion_tokens = await _run_completion(
-            prompt, req.max_tokens, stop_seqs,
-        )
-        return JSONResponse({
-            "id": f"cmpl-{uuid.uuid4().hex}",
-            "object": "text_completion",
+app = FastAPI(lifespan=_lifespan)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/v1/models")
+async def models():
+    return {
+        "object": "list",
+        "data": [{
+            "id": _state.get("model_id", "qwen3.5-9b"),
+            "object": "model",
             "created": int(time.time()),
-            "model": _state.get("model_id", "qwen3.5-9b"),
-            "choices": [{"text": text, "index": 0, "finish_reason": finish_reason}],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
-        })
-
-    return app
+            "owned_by": "local",
+        }],
+    }
 
 
-async def _run_completion(prompt: str, max_tokens: int, stop_seqs: list[str]):
-    tok = _state["tokenizer"]
-    model = _state["model"]
-    device = _state["device"]
-    lock: asyncio.Lock = _state["lock"]
-
-    input_ids = tok(prompt, return_tensors="pt").input_ids.to(device)
-    prompt_len = input_ids.shape[1]
-
-    async with lock:
-        output_ids = await asyncio.to_thread(
-            model.generate, input_ids, max_tokens,
+@app.post("/v1/completions")
+async def completions(req: CompletionRequest):
+    prompt = req.prompt if isinstance(req.prompt, str) else req.prompt[0]
+    if req.stream:
+        return StreamingResponse(
+            _stream_completion(prompt, req.max_tokens),
+            media_type="text/event-stream",
         )
-    gen_ids = output_ids[0, prompt_len:].tolist()
-    text, finish_reason, emitted = _decode_with_stop(gen_ids, tok, stop_seqs, max_tokens)
-    return text, finish_reason, prompt_len, emitted
+    return await _nonstream_completion(prompt, req.max_tokens)
 
 
-async def _stream_completion(prompt: str, max_tokens: int, stop_seqs: list[str]):
+def _submit_request(prompt: str, max_tokens: int) -> tuple[EngineRequest, int]:
+    tok = _state["tokenizer"]
+    engine: StepEngine = _state["engine"]
+    device = _state["device"]
+    prompt_ids = tok(prompt, return_tensors="pt").input_ids.to(device)
+    prompt_len = prompt_ids.shape[1]
+    req = EngineRequest(
+        prompt_ids=prompt_ids, max_tokens=max_tokens,
+        out_queue=asyncio.Queue(), done=asyncio.Event(),
+    )
+    engine.submit(req)
+    return req, prompt_len
+
+
+async def _stream_completion(prompt: str, max_tokens: int):
+    tok = _state["tokenizer"]
+    model_id = _state.get("model_id", "qwen3.5-9b")
     cmpl_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
-    model_id = _state.get("model_id", "qwen3.5-9b")
-    text, finish_reason, _pt, _ct = await _run_completion(prompt, max_tokens, stop_seqs)
 
-    def frame(text_chunk: str, finish: str | None) -> str:
+    req, prompt_len = _submit_request(prompt, max_tokens)
+    gen_token_ids: list[int] = []
+    emitted_text = ""
+
+    def chunk_frame(text_chunk: str, finish: str | None) -> str:
         payload = {
             "id": cmpl_id, "object": "text_completion", "created": created, "model": model_id,
             "choices": [{"text": text_chunk, "index": 0, "finish_reason": finish}],
         }
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    if text:
-        yield frame(text, None)
-    yield frame("", finish_reason)
-    yield "data: [DONE]\n\n"
+    while True:
+        token_id, finish_reason = await req.out_queue.get()
+        if token_id is not None:
+            gen_token_ids.append(token_id)
+            full = tok.decode(gen_token_ids, skip_special_tokens=True)
+            delta = full[len(emitted_text):]
+            emitted_text = full
+            if delta:
+                yield chunk_frame(delta, None)
+            else:
+                # Emit an empty per-token frame anyway so the SSE consumer sees
+                # one data frame per generated token (matching the per-token contract).
+                yield chunk_frame("", None)
+        if finish_reason is not None:
+            yield chunk_frame("", finish_reason)
+            yield "data: [DONE]\n\n"
+            return
 
 
-def _decode_with_stop(token_ids: list[int], tokenizer, stop_seqs: list[str], max_tokens: int):
-    if not token_ids:
-        return "", "stop", 0
-    finish_reason = "length" if len(token_ids) >= max_tokens else "stop"
-    truncated = token_ids
-    if truncated and truncated[-1] == VibeServeModel.EOS_TOKEN_ID:
-        truncated = truncated[:-1]
-        finish_reason = "stop"
-    text = tokenizer.decode(truncated, skip_special_tokens=True)
-    if stop_seqs:
-        cut = len(text)
-        hit_stop = False
-        for s in stop_seqs:
-            if not s:
-                continue
-            i = text.find(s)
-            if i != -1 and i < cut:
-                cut = i
-                hit_stop = True
-        if hit_stop:
-            text = text[:cut]
-            finish_reason = "stop"
-    emitted = len(truncated) if not stop_seqs else len(
-        tokenizer(text, add_special_tokens=False).input_ids
-    )
-    return text, finish_reason, emitted
+async def _nonstream_completion(prompt: str, max_tokens: int):
+    tok = _state["tokenizer"]
+    model_id = _state.get("model_id", "qwen3.5-9b")
+    cmpl_id = f"cmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
 
+    req, prompt_len = _submit_request(prompt, max_tokens)
+    gen_token_ids: list[int] = []
+    finish_reason = "stop"
+    while True:
+        token_id, fr = await req.out_queue.get()
+        if token_id is not None:
+            gen_token_ids.append(token_id)
+        if fr is not None:
+            finish_reason = fr
+            break
 
-app = _make_app()
+    text = tok.decode(gen_token_ids, skip_special_tokens=True)
+    return JSONResponse({
+        "id": cmpl_id,
+        "object": "text_completion",
+        "created": created,
+        "model": model_id,
+        "choices": [{"text": text, "index": 0, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": prompt_len,
+            "completion_tokens": len(gen_token_ids),
+            "total_tokens": prompt_len + len(gen_token_ids),
+        },
+    })
 
 
 if __name__ == "__main__":
