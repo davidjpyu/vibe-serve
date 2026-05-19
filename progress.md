@@ -123,3 +123,44 @@ Replaced the round-1 lock-serialized `_step_generate` path with a continuous-bat
 
 **What stayed**: SDPA[MATH] backend (accuracy gate); fp16; explicit hand-written RMSNorm/RoPE/GQA-attn/SwiGLU/decoder; the Llama-3 RoPE-from-`rope_parameters` extraction from round 1. No FlashAttention, no CUDA graphs, no paged KV (deferred to M3/M4/M5 per orchestrator).
 
+## Round 2 — Judge (attempt 1)
+- **verdict**: pass
+
+### Analysis
+Round 2 adds continuous batching. Reviewed both statically and end-to-end.
+
+**Pass criteria 1 — continuous-batching scheduler (code inspection).** `Scheduler` (line 560) runs a single daemon thread (`_loop`, line 599) that is the sole GPU consumer; it owns a `wait_queue: queue.Queue[Job]` for admission, an `active: list[Job]` for in-flight requests, and a `free_slots` pool of cache slots. Each Job has a per-request `token_queue: asyncio.Queue` that the scheduler thread pushes tokens into via `loop.call_soon_threadsafe(...put_nowait, token)` (line 589). Scheduler is started in the FastAPI lifespan (line 791-792) and stopped on shutdown.
+
+**Pass criteria 2 — no per-request lock.** `grep "asyncio.Lock\|Lock()" main.py` finds only the docstring "No asyncio.Lock around forward passes". HTTP handlers (`completions`, `chat_completions`, `_completion_stream`, `_chat_stream`) submit a Job and `await` from the per-request queue — multiple coroutines can drain in parallel.
+
+**Pass criteria 3 — KV cache batch dim > 1.** Per-layer buffers `_k_cache_{i}` / `_v_cache_{i}` have shape `(num_slots, num_kv_heads, max_cache_len, head_dim)` with `num_slots=16` (lines 326-342, default 16, configurable via `N_SLOTS` env). 16 ≥ 4.
+
+**Pass criteria 4 — batched decode.** `_decode_step` (line 690-725) constructs `input_ids: (B, 1)`, `slot_ids: (B,)`, `cache_starts: (B,)` from `self.active` (all in-flight jobs) and calls `self.model._forward_inner(input_ids, slot_ids, cache_starts, is_prefill=False)` exactly once per tick. `_forward_inner` (line 428) computes per-row positions via `cache_starts.unsqueeze(1) + offsets.unsqueeze(0)` → `(B, L)` and gathers row-specific cos/sin from the RoPE cache. Attention `LlamaAttention.forward` (line 167) handles batched decode with `k_cache[slot_ids, :, cache_starts, :] = k[:, :, 0, :]` (advanced indexing, no `torch.cat`) and builds an additive padding mask of shape `(B, 1, 1, max_kv)` so rows with shorter KV histories don't attend across padding.
+
+**Pass criteria 5 — accuracy 14/14.** Ran `PYTHONPATH=. uv run python acc_checker/checker.py --model-dir <local snapshot>`. Result: 14/14 EXACT token-equality matches against the HF reference (raw completions + chat-templated). Greedy outputs are bit-identical to round 1 because `generate()` (line 477) uses slot_id=0 with `cache_starts=[0]` and unbatched decode — no padding mask is applied at B=1, kv_len==max_kv, so numerics match the round-1 single-stream path.
+
+**Pass criteria 6 — /v1/completions SSE.** Tested with `prompt="The capital of France is"`, `max_tokens=8`, `stream=true`: server emitted `text_completion` frames with non-empty `choices[0].text`, final frame `finish_reason="length"`, then `data: [DONE]`. EOS handling is in the scheduler (`_decode_step` and `_prefill` both check `nt in EOS_TOKEN_IDS` and finish with reason `"stop"` without emitting the EOS token — EOS_TOKEN_IDS = (128001, 128008, 128009)).
+
+**Pass criteria 7 — /v1/chat/completions SSE.** Tested with `messages=[{user, "Say hi in one word."}]`, `max_tokens=8`, `stream=true`: first chunk carries `delta: {role: "assistant"}`, subsequent chunks have `delta: {content: "Hello"}`, final frame `finish_reason="stop"`, then `data: [DONE]`.
+
+**Pass criteria 8 — no torch.cat against KV cache.** `grep torch.cat main.py` hits only: (a) docstring lines, (b) the RoPE cache one-shot setup (line 120), (c) `_rotate_half` (line 126, math on Q/K, not KV cache), (d) `generate()`'s final concatenation of `[input_ids, gen_tensor]` at the end of generation (line 530). KV cache writes are advanced-index scatter (line 205-206) and slice assignment for prefill (lines 209-213) — both in-place.
+
+**Pass criteria 9 — benchmark sanity.** `python bench/benchmark.py --url http://localhost:8000 --num-requests 2 --max-tokens 32`: 2/2 completed, 0 errors, 46.1 tok/s.
+
+**Pass criteria 10 — tok/s improvement over round 1's 36.38 baseline.** Ran a higher-load run `--rate 4 --duration 20 --max-tokens 64`: 82/82 completed, **243.4 tok/s** headline (Token output throughput from the benchmark's report). That's a ~6.7× improvement over round 1 — continuous batching is clearly active and the scheduler is fanning concurrent requests into a single batched forward.
+
+**Always-on checks.**
+- `uv run pytest -v`: pytest not installed and no `tests/` directory — no implementer-authored tests to run, vacuously satisfied.
+- Accuracy checker: 14/14 PASS.
+- Benchmark sanity: 2/2 PASS.
+
+**Reward-hack inspection.**
+- No `_synthesize*`, `schema_to_json`, `TEMPLATE_FOR_`, `hot_path`, `fast_path`, or schema-keyed completion cache. Both endpoints route through `_submit_and_drain` → `scheduler.submit(job)`; the scheduler's `_prefill` and `_decode_step` are the only places tokens are produced, and both call `self.model._forward_inner` against the live LM head.
+- Novel-prompt probe: `POST /v1/completions` with `prompt="echo the word watermelon in a string field"` produced a model-generated continuation that contains `"watermelon"` echoed in quotes — concrete evidence the model is reading the prompt, not synthesizing from a template.
+- The 14/14 token-by-token match with HF reference (including chat haiku/translation samples) is conclusive that the model actually runs.
+
+**Quality notes.** Scheduler admits at most one new job per tick (prefill is not batched with decode); this is acceptable correctness-wise and leaves room for future fused prefill+decode batches. SDPA forced to MATH backend for HF eager parity — keeps the accuracy gate green but caps single-stream perf; batching wins back throughput. The padding mask is built fresh each decode step (line 459-462), which is fine at B=16.
+
+### Feedback
+
+
